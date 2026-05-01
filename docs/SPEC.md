@@ -25,7 +25,7 @@ This spec is the contract. It mirrors Odoo 18's `_read_group` semantics where th
 - Auto-traversal of one-to-many / many-to-many relations for measures. Silent row multiplication corrupts every measure in the same query — Odoo refuses this and so do we. `array_agg` is the explicit escape hatch.
 - Permission integration. The library expects a pre-scoped queryset; the caller has already applied `accessible_by(user)` or `filter(owner=request.user)`. This keeps it compatible with django-guardian, django-rules, [django-rebac](#) (when published), or hand-rolled permission systems.
 - Cursor pagination on grouped results was deferred in early drafts; v1.0 ships an opt-in Relay-style connection alongside the offset shape. See § 4 cursor-pagination.
-- Aggregation-of-relation as a top-level field on the parent (e.g. `order.itemsAggregate`). Use a top-level `<child>Aggregate(filter: { parent: { id: $id } })` query on the child model instead.
+- Aggregation-of-relation as a top-level field on the parent was deferred in early drafts; v1.0 ships an opt-in helper :func:`register_relation_aggregate` that attaches `<relation>Aggregate(filter: ...)` to existing strawberry-django parent types. Per-row resolver in v1.0; proper dataloader-based batching is a v1.x improvement target. See § 4.2.
 
 ## 2 · Why a separate library
 
@@ -224,6 +224,73 @@ This works uniformly for single-level (`group_by=[("customer", None)]`) and mult
 **`totalCount`.** Same DB-side `COUNT(DISTINCT ...)` path as the offset field's `totalCount` — no Python-side row materialization. The count reflects the post-`having` group cardinality and ignores `first`/`last`/`after`/`before` (the page is a window over the total).
 
 **Determinism.** `pagination_style="offset"` (default) emits byte-identical SDL to pre-Stream-11 builds — the determinism test passes unchanged. `pagination_style="cursor"` and `pagination_style="both"` produce stable SDL across two generations of the same builder (Critical Rule 2). The cursor encoding is also stable across Python versions and operating systems (no timestamps, no PRNG, no insertion-order dependence).
+
+### 4.2 · Relation aggregate field on the parent
+
+The default story for "give me the aggregate of a child relation" is to issue a top-level `<child>Aggregate(filter: { parent: { id: $id } })` query on the child model. That works for ad-hoc analytics but doesn't compose well with list views — fetching N customers and their order rollups means N round-trips, or an awkward client-side join.
+
+`register_relation_aggregate(parent_type, relation_name, child_built, *, field_name=None, filter_type=None, get_queryset=None)` attaches a new field to a strawberry-django parent type:
+
+```python
+from strawberry_django_aggregates import (
+    AggregateBuilder, register_relation_aggregate,
+)
+
+order_built = AggregateBuilder(
+    model=Order, aggregate_fields=["total", "quantity"],
+).build()
+
+@strawberry_django.type(Customer)
+class CustomerType:
+    id: int
+    name: str
+
+register_relation_aggregate(CustomerType, "orders", order_built)
+
+@strawberry.type
+class Query:
+    customers: list[CustomerType] = strawberry_django.field()
+```
+
+The schema gains:
+
+```graphql
+type CustomerType {
+  id: Int!
+  name: String!
+  ordersAggregate: OrderAggregate!
+}
+```
+
+Clients then issue:
+
+```graphql
+{
+  customers {
+    id
+    name
+    ordersAggregate {
+      count
+      sum { total }
+    }
+  }
+}
+```
+
+**Internals.** The resolver runs once per parent row — it resolves the reverse-accessor manager (`getattr(customer, "orders")`), optionally filters via `strawberry_django.filters.apply` if a `filter_type` was wired, and calls `compute_aggregation` on the child queryset. The result row is shaped via :func:`shape_aggregate_row` (the same helper the top-level aggregate field uses).
+
+**Filter argument.** Pass `filter_type=<OrderFilter>` to expose `ordersAggregate(filter: ...)` on the parent. Strawberry-django composes the filter onto the child queryset before aggregation. Permissions still apply through the `get_queryset` hook (or the parent's pre-scoped queryset, by default).
+
+**Critical Rule 4 unchanged.** This is the explicit subquery path — the child queryset is single-model from the child's perspective, so no `__`-traversal of parent relations occurs in the measure. Auto-traversal of one-to-many / many-to-many in the child's own measures still requires `compute_aggregation(allow_relation_traversal=True)` per § 11.
+
+**N+1 caveat (v1.0).** Each parent row triggers one aggregate query. For a list of 50 customers showing daily-bucketed order rollups, that is 50 aggregation queries. v1.0 accepts this cost; the alternatives are:
+
+- For long-tail parents, prefer the top-level `<child>Aggregate(filter: { parent: { id: $id } })` — one query.
+- Wait for v1.x to ship a dataloader-based batching pass that consolidates the per-row aggregations into a single child query grouped by the parent FK and dispatches results back through the per-row resolver.
+
+The dataloader approach is a separate engineering task — it requires pre-walking the GraphQL selection at parent-list time so the batched child query annotates the correct measures. Out of scope for v1.0; the per-row implementation is a clean fallback path that batched implementations can defer to when batching is impossible (e.g. when the filter argument's value differs per parent row, which `compute_aggregation` cannot handle in a single query).
+
+**Determinism.** Re-registering the same `(parent_type, relation_name, child_built)` tuple replaces the existing field by `python_name` — the cached `StrawberryObjectDefinition.fields` list is deduplicated before append. Two builds of the same schema produce byte-identical SDL.
 
 ## 5 · Aggregate operator vocabulary
 

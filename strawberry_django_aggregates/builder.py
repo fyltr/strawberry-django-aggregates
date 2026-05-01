@@ -1397,25 +1397,10 @@ class AggregateBuilder:
         requested: list[tuple[AggregateOp, str | None]],
         op_args: dict[str, dict[str, Any]] | None = None,
     ) -> Any:
-        kwargs: dict[str, Any] = {"count": int(row.get("count", 0) or 0)}
-        kwargs.update(
-            self._build_nested_op_kwargs(
-                aggregate_type, row, requested,
-            ),
+        return shape_aggregate_row(
+            aggregate_type, row, requested,
+            op_args=op_args, json_paths=self.json_paths,
         )
-        instance = aggregate_type(**kwargs)
-        # Stash count_distinct lookup table for the resolver method —
-        # both the single-column and the multi-column tuple shapes
-        # are populated. Single-column keys on the field-name string;
-        # multi-column keys on a sorted tuple of field-name strings
-        # (matches the wire-side canonicalization).
-        self._populate_count_distinct_backing(instance, row, requested)
-        # Stash percentile backing dicts keyed by ``(field, fraction)``
-        # so the method-style resolver can pull the right SQL alias —
-        # the alias was assigned via the fraction-derived suffix in
-        # :func:`compiler.aggregate_alias`, not by the bare field name.
-        self._populate_percentile_backing(instance, row, requested, op_args)
-        return instance
 
     def _shape_grouped(
         self,
@@ -1561,65 +1546,13 @@ class AggregateBuilder:
         """Build ``{op_name: NestedFieldsType(...)}`` kwargs for the
         nested operator types attached to ``owner_type``.
 
-        ``COUNT``, ``COUNT_DISTINCT``, ``PERCENTILE_CONT``, and
-        ``PERCENTILE_DISC`` are method-style — they bind through
-        backing dicts on the instance, not the dataclass field map —
-        and are skipped here.
+        Thin instance-bound delegate to the module-level helper —
+        kept for backwards-compatibility with subclasses that may
+        have overridden it before Stream 9 extracted the logic.
         """
-        # Group requested aggregates by op. JSON-path fields use the
-        # alias-form name (``metadata__amount``) on the dataclass and
-        # in the row dict; the ``requested`` list carries the dotted
-        # form (``metadata.amount``) so the compiler can detect JSON
-        # paths. Translate here for both purposes.
-        by_op: dict[AggregateOp, dict[str, Any]] = {}
-        for op, fp in requested:
-            if op in {
-                AggregateOp.COUNT,
-                AggregateOp.COUNT_DISTINCT,
-                AggregateOp.COUNT_DISTINCT_TUPLE,
-                AggregateOp.PERCENTILE_CONT,
-                AggregateOp.PERCENTILE_DISC,
-            }:
-                continue
-            assert fp is not None
-            if self.json_paths and fp in self.json_paths:
-                emit_fp = fp.replace(".", "__")
-            else:
-                emit_fp = fp
-            by_op.setdefault(op, {})[emit_fp] = row.get(
-                f"{op.value}_{emit_fp}",
-            )
-
-        out: dict[str, Any] = {}
-        for op, fields_dict in by_op.items():
-            nested_attr = op.value
-            nested_type_field = next(
-                (
-                    f for f in dataclasses.fields(owner_type)
-                    if f.name == nested_attr
-                ),
-                None,
-            )
-            if nested_type_field is None:
-                continue
-            nested_type = _unwrap_optional(nested_type_field.type)
-            instance = nested_type(**fields_dict)
-            out[nested_attr] = instance
-            # SQL-standard wire aliases (Stream 4): ``every`` mirrors
-            # ``bool_and`` and ``some`` mirrors ``bool_or``. The owner
-            # type only declares these fields when its allowlist
-            # admits BOOL_AND / BOOL_OR, so we guard with a field
-            # presence check before assigning. Both aliases share the
-            # SAME nested-type instance — no duplicate construction.
-            if op is AggregateOp.BOOL_AND and any(
-                f.name == "every" for f in dataclasses.fields(owner_type)
-            ):
-                out["every"] = instance
-            elif op is AggregateOp.BOOL_OR and any(
-                f.name == "some" for f in dataclasses.fields(owner_type)
-            ):
-                out["some"] = instance
-        return out
+        return _build_nested_op_kwargs(
+            owner_type, row, requested, json_paths=self.json_paths,
+        )
 
 
 @dataclass
@@ -1765,3 +1698,127 @@ def _keyset_filter(
     for c in clauses:
         combined = c if combined is None else combined | c
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Aggregate-row shaping — public helper
+# ---------------------------------------------------------------------------
+#
+# Stream 9 extracted the per-row shaping logic out of
+# :meth:`AggregateBuilder._shape_aggregate` so it could be reused by
+# :func:`relations.register_relation_aggregate`'s per-row resolver.
+# The shaping is pure: given an aggregate dataclass type, a result-row
+# dict, the list of requested operators, optional ``op_args`` (for
+# percentiles), and optional ``json_paths`` (for JSON-path alias
+# translation), it builds and returns the dataclass instance with all
+# nested-type kwargs populated and method-style backing dicts
+# attached. No queryset, no GraphQL ``info`` — callable from any
+# Python context.
+
+
+def _build_nested_op_kwargs(
+    owner_type: type,
+    row: dict[str, Any],
+    requested: list[tuple[AggregateOp, str | None]],
+    *,
+    json_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Module-level twin of :meth:`AggregateBuilder._build_nested_op_kwargs`.
+
+    Identical logic — see the in-method comments. Lives at module
+    scope so :func:`shape_aggregate_row` and the relation-aggregate
+    resolver can call it without an :class:`AggregateBuilder`
+    instance.
+    """
+    by_op: dict[AggregateOp, dict[str, Any]] = {}
+    for op, fp in requested:
+        if op in {
+            AggregateOp.COUNT,
+            AggregateOp.COUNT_DISTINCT,
+            AggregateOp.COUNT_DISTINCT_TUPLE,
+            AggregateOp.PERCENTILE_CONT,
+            AggregateOp.PERCENTILE_DISC,
+        }:
+            continue
+        assert fp is not None
+        if json_paths and fp in json_paths:
+            emit_fp = fp.replace(".", "__")
+        else:
+            emit_fp = fp
+        by_op.setdefault(op, {})[emit_fp] = row.get(
+            f"{op.value}_{emit_fp}",
+        )
+
+    out: dict[str, Any] = {}
+    for op, fields_dict in by_op.items():
+        nested_attr = op.value
+        nested_type_field = next(
+            (
+                f for f in dataclasses.fields(owner_type)
+                if f.name == nested_attr
+            ),
+            None,
+        )
+        if nested_type_field is None:
+            continue
+        nested_type = _unwrap_optional(nested_type_field.type)
+        instance = nested_type(**fields_dict)
+        out[nested_attr] = instance
+        # SQL-standard wire aliases (Stream 4): ``every`` mirrors
+        # ``bool_and`` and ``some`` mirrors ``bool_or``.
+        if op is AggregateOp.BOOL_AND and any(
+            f.name == "every" for f in dataclasses.fields(owner_type)
+        ):
+            out["every"] = instance
+        elif op is AggregateOp.BOOL_OR and any(
+            f.name == "some" for f in dataclasses.fields(owner_type)
+        ):
+            out["some"] = instance
+    return out
+
+
+def shape_aggregate_row(
+    aggregate_type: type,
+    row: dict[str, Any],
+    requested: list[tuple[AggregateOp, str | None]],
+    *,
+    op_args: dict[str, dict[str, Any]] | None = None,
+    json_paths: dict[str, str] | None = None,
+) -> Any:
+    """Shape a single ``compute_aggregation`` result row into an
+    instance of ``aggregate_type`` (the dataclass produced by
+    :func:`make_aggregate_type`).
+
+    Public, framework-agnostic helper extracted from
+    :meth:`AggregateBuilder._shape_aggregate` for reuse by
+    :func:`strawberry_django_aggregates.relations.register_relation_aggregate`
+    (Stream 9). Identical contract to the builder method:
+
+    - Populates ``count`` from ``row["count"]`` (defaults to ``0``).
+    - Populates one nested-type kwarg per field-distributed operator
+      via :func:`_build_nested_op_kwargs`.
+    - Attaches the ``__count_distinct__`` /
+      ``__count_distinct_tuple__`` backing dicts so the method-style
+      ``countDistinct`` resolver can look up its result.
+    - Attaches ``__percentile_cont__`` / ``__percentile_disc__``
+      backing dicts keyed by ``(field, fraction)`` for the
+      percentile resolvers.
+
+    ``json_paths`` is the same allowlist passed to
+    :func:`compute_aggregation` — it controls dotted→alias
+    translation for JSON-path measures.
+    """
+    kwargs: dict[str, Any] = {"count": int(row.get("count", 0) or 0)}
+    kwargs.update(
+        _build_nested_op_kwargs(
+            aggregate_type, row, requested, json_paths=json_paths,
+        ),
+    )
+    instance = aggregate_type(**kwargs)
+    AggregateBuilder._populate_count_distinct_backing(
+        instance, row, requested,
+    )
+    AggregateBuilder._populate_percentile_backing(
+        instance, row, requested, op_args,
+    )
+    return instance

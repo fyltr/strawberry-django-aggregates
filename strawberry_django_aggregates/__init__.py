@@ -29,6 +29,12 @@ Public surface:
   cursor encoding for Relay-style grouped pagination (SPEC § 4
   cursor-pagination). Pure stdlib; the same encoding is used by the
   builder's connection field.
+- :func:`register_relation_aggregate` — attach a
+  ``<relation>Aggregate(filter: ...)`` field on an existing
+  strawberry-django parent type so callers can issue
+  ``customer.ordersAggregate { count, sum { total } }``. Per-row
+  resolver in v1.0; dataloader-based batching is a v1.x improvement
+  (SPEC § 4.2 / Stream 9).
 - :func:`make_grouped_connection_type` — emit Relay-style
   ``<Model>GroupedConnection`` / ``<Model>GroupedEdge`` types.
 - Errors: :class:`AggregateError`, :class:`OperatorNotSupportedError`,
@@ -71,6 +77,9 @@ from strawberry_django_aggregates.ordering import (
 from strawberry_django_aggregates.pagination import (
     decode_group_cursor,
     encode_group_cursor,
+)
+from strawberry_django_aggregates.relations import (
+    register_relation_aggregate,
 )
 from strawberry_django_aggregates.types import (
     BigInt,
@@ -115,6 +124,10 @@ __all__ = [
     # canonical-order group-by alias values (SPEC § 4 / Stream 11).
     "encode_group_cursor",
     "decode_group_cursor",
+    # Cross-relation aggregate field — attach
+    # ``<relation>Aggregate(filter: ...)`` to a strawberry-django
+    # parent type (SPEC § 4.2 / Stream 9).
+    "register_relation_aggregate",
     # Ordering
     "parse_aggregate_order",
     "comodel_ordering_terms",
