@@ -21,7 +21,7 @@ import datetime
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import strawberry
 import strawberry_django
@@ -49,11 +49,16 @@ from strawberry_django_aggregates.ordering import (
     aggregate_aliases_from_spec,
     parse_aggregate_order,
 )
+from strawberry_django_aggregates.pagination import (
+    decode_group_cursor,
+    encode_group_cursor,
+)
 from strawberry_django_aggregates.types import (
     BucketRange,
     make_aggregate_type,
     make_group_by_spec,
     make_group_order_input,
+    make_grouped_connection_type,
     make_grouped_type,
     make_having_input,
 )
@@ -135,6 +140,17 @@ class AggregateBuilder:
         MUST construct the schema with
         :class:`strawberry.federation.Schema` for directives to print.
         See SPEC § 18 for the design rationale and v1.1 roadmap.
+    pagination_style : ``"offset"`` (default), ``"cursor"``, or ``"both"``.
+        Controls which paginated grouped-result field the builder
+        emits. ``"offset"`` keeps only the existing
+        ``<model>GroupBy`` field returning ``<Model>GroupedResult``
+        (offset/limit) — the default for backward compatibility.
+        ``"cursor"`` replaces it with a Relay-style
+        ``<model>GroupBy`` field returning
+        ``<Model>GroupedConnection`` (``first`` / ``after`` /
+        ``last`` / ``before``). ``"both"`` emits BOTH fields:
+        ``<model>GroupBy`` (offset) plus ``<model>GroupByConnection``
+        (cursor). See SPEC § 4 cursor pagination.
     """
 
     model:            type[Model]
@@ -148,6 +164,7 @@ class AggregateBuilder:
     enable_federation: bool = False
     get_queryset:     Callable[[Any], QuerySet] | None = None
     respect_comodel_ordering: bool = False
+    pagination_style: Literal["offset", "cursor", "both"] = "offset"
 
     def build(self) -> BuiltAggregates:
         """Generate all types and return them along with attached fields."""
@@ -192,14 +209,48 @@ class AggregateBuilder:
         aggregate_field = self._build_aggregate_field(
             aggregate_type=aggregate_type,
         )
-        group_by_field = self._build_group_by_field(
-            group_by_spec=group_by_spec,
-            having_input=having_input,
-            group_order_input=group_order_input,
-            grouped_type=grouped_type,
-            group_key_type=group_key_type,
-            grouped_result_type=grouped_result_type,
-        )
+
+        # Cursor-pagination types are emitted only when the consumer
+        # opts in. The default ``"offset"`` path keeps SDL byte-
+        # identical to pre-Stream-11 builds (CLAUDE.md Critical Rule 2).
+        grouped_connection_type: type | None = None
+        grouped_connection_edge_type: type | None = None
+        page_info_type: type | None = None
+        if self.pagination_style in {"cursor", "both"}:
+            (
+                grouped_connection_edge_type,
+                page_info_type,
+                grouped_connection_type,
+            ) = make_grouped_connection_type(
+                self.model,
+                name=name,
+                grouped_type=grouped_type,
+                enable_federation=self.enable_federation,
+            )
+
+        group_by_field: Any = None
+        grouped_connection_field: Any = None
+        if self.pagination_style in {"offset", "both"}:
+            group_by_field = self._build_group_by_field(
+                group_by_spec=group_by_spec,
+                having_input=having_input,
+                group_order_input=group_order_input,
+                grouped_type=grouped_type,
+                group_key_type=group_key_type,
+                grouped_result_type=grouped_result_type,
+            )
+        if self.pagination_style in {"cursor", "both"}:
+            assert grouped_connection_type is not None
+            assert grouped_connection_edge_type is not None
+            grouped_connection_field = self._build_group_by_connection_field(
+                group_by_spec=group_by_spec,
+                having_input=having_input,
+                group_order_input=group_order_input,
+                grouped_type=grouped_type,
+                group_key_type=group_key_type,
+                grouped_connection_type=grouped_connection_type,
+                grouped_edge_type=grouped_connection_edge_type,
+            )
 
         return BuiltAggregates(
             aggregate_type=aggregate_type,
@@ -211,6 +262,10 @@ class AggregateBuilder:
             groupable_field_enum=groupable_field_enum,
             aggregate_field=aggregate_field,
             group_by_field=group_by_field,
+            grouped_connection_type=grouped_connection_type,
+            grouped_connection_edge_type=grouped_connection_edge_type,
+            page_info_type=page_info_type,
+            grouped_connection_field=grouped_connection_field,
         )
 
     # ------- aggregate field (no group_by) --------------------------------
@@ -421,6 +476,369 @@ class AggregateBuilder:
         return strawberry_django.field(
             resolver=resolver, disable_optimization=True,
         )
+
+    # ------- group_by connection field (cursor pagination) ----------------
+
+    def _build_group_by_connection_field(
+        self, *,
+        group_by_spec: type,
+        having_input: type,
+        group_order_input: type,
+        grouped_type: type,
+        group_key_type: type,
+        grouped_connection_type: type,
+        grouped_edge_type: type,
+    ) -> Any:
+        """Relay-style cursor-paginated grouped field.
+
+        SPEC § 4 cursor pagination. The cursor is an opaque
+        base64-encoded JSON of the canonical-order group-by alias
+        values; keyset filter on the next page is
+        ``(a, b, c) > (cursor_a, cursor_b, cursor_c)`` (forward) or
+        ``< (...)`` (backward). HAVING and ``order_by`` arguments are
+        accepted for parity with the offset field, but for cursor
+        stability the ORDER BY is forced to canonical group-alias
+        ordering — user ``order_by`` is documented as out-of-scope on
+        the cursor field in v1.0 (it would break keyset semantics).
+
+        Empty-bucket ``fill`` is also out-of-scope on the cursor field
+        in v1.0 — fill expands the row set with zero-count buckets
+        whose underlying ``group_by`` values may not have an obvious
+        cursor encoding (the spine is generated, not joined). Pass
+        the offset variant if you need fill.
+        """
+        from strawberry.relay import PageInfo as _PageInfo
+        builder = self
+        filter_type = self.filter_type
+        a_fields = builder._a_fields()
+
+        def resolver(
+            info: strawberry.Info,
+            group_by: Any,
+            filter:    Any = None,
+            having:    Any = None,
+            first:     int | None = None,
+            after:     str | None = None,
+            last:      int | None = None,
+            before:    str | None = None,
+            week_start: int = 1,
+        ) -> Any:
+            qs = builder._resolve_queryset(info)
+            if filter is not None:
+                qs = apply_filters(filter, qs, info=info)
+
+            spec = builder._translate_group_by(group_by)
+            op_args: dict[str, dict[str, Any]] = {}
+            requested = builder._requested_aggregate_ops_grouped_connection(
+                info, a_fields, op_args=op_args,
+            )
+            having_dict = builder._translate_having(having, requested)
+            ws = builder._resolve_week_start(week_start)
+
+            # Validate first / last bounds. Relay convention: at most
+            # one of (first, last) may be set; non-negative.
+            f_val, l_val = builder._validate_first_last(first, last)
+            after_vals = (
+                decode_group_cursor(after) if after else None
+            )
+            before_vals = (
+                decode_group_cursor(before) if before else None
+            )
+
+            # Determine pagination direction. ``last`` reverses scan
+            # order so we can grab the trailing page; we re-reverse
+            # the materialized rows before encoding edges.
+            backward = l_val is not None
+            # ``page_size`` is the user's requested edge count. ``None``
+            # means "no first/last given" — fall through to a sensible
+            # bounded default in :meth:`_cursor_paginated_rows`. ``0``
+            # is a valid Relay request (probe-only) — short-circuit to
+            # an empty page WITHOUT hitting the DB for the rows scan.
+            page_size = (
+                f_val if f_val is not None else l_val
+            )
+
+            if page_size == 0:
+                rows: list[dict[str, Any]] = []
+                has_extra = False
+            else:
+                rows = builder._cursor_paginated_rows(
+                    qs=qs,
+                    spec=spec,
+                    requested=requested,
+                    having_dict=having_dict,
+                    op_args=op_args,
+                    week_start=ws,
+                    after_vals=after_vals,
+                    before_vals=before_vals,
+                    page_size=page_size,
+                    backward=backward,
+                )
+                # Slicing semantics — Relay over keyset:
+                # - We requested ``page_size + 1`` rows; the extra row,
+                #   if present, signals there is more data in the scan
+                #   direction. Drop it before encoding edges.
+                has_extra = (
+                    page_size is not None and len(rows) > page_size
+                )
+                if has_extra and page_size is not None:
+                    rows = rows[:page_size]
+                # If we scanned backward (``last``), reverse the rows
+                # so the edges come out in canonical (forward) order.
+                if backward:
+                    rows = list(reversed(rows))
+
+            total = builder._count_groups(
+                qs, spec, requested, having_dict,
+                op_args=op_args, week_start=ws,
+            )
+
+            edges: list[Any] = []
+            for row in rows:
+                cursor_values = builder._cursor_values_for_row(
+                    row, spec, group_key_type,
+                )
+                cursor = encode_group_cursor(cursor_values)
+                node = builder._shape_grouped(
+                    grouped_type, group_key_type, row, requested, spec,
+                    op_args=op_args, week_start=ws,
+                )
+                edges.append(grouped_edge_type(cursor=cursor, node=node))
+
+            # Forward pagination semantics:
+            #   ``hasNextPage`` is True when scanning forward and we
+            #   detected the extra row, OR we walked from a ``before``
+            #   cursor (the rows logically before that cursor exist).
+            #   ``hasPreviousPage`` is True when ``after`` was set
+            #   (rows exist before the page) OR scanning backward and
+            #   we detected the extra row.
+            if backward:
+                has_next = before_vals is not None
+                has_previous = has_extra
+            else:
+                has_next = has_extra
+                has_previous = after_vals is not None
+
+            page_info = _PageInfo(
+                has_next_page=has_next,
+                has_previous_page=has_previous,
+                start_cursor=edges[0].cursor if edges else None,
+                end_cursor=edges[-1].cursor if edges else None,
+            )
+
+            return grouped_connection_type(
+                edges=edges,
+                page_info=page_info,
+                total_count=total,
+            )
+
+        annotations: dict[str, Any] = {
+            "info":       strawberry.Info,
+            "group_by":   list[group_by_spec],  # type: ignore[valid-type]
+        }
+        if filter_type is not None:
+            annotations["filter"] = filter_type | None
+        annotations["having"]     = having_input | None
+        annotations["first"]      = int | None
+        annotations["after"]      = str | None
+        annotations["last"]       = int | None
+        annotations["before"]     = str | None
+        annotations["week_start"] = int
+        annotations["return"]     = grouped_connection_type
+
+        if filter_type is None:
+            def resolver_no_filter(
+                info: strawberry.Info,
+                group_by: Any,
+                having:    Any = None,
+                first:     int | None = None,
+                after:     str | None = None,
+                last:      int | None = None,
+                before:    str | None = None,
+                week_start: int = 1,
+            ) -> Any:
+                return resolver(
+                    info=info, group_by=group_by, filter=None,
+                    having=having, first=first, after=after,
+                    last=last, before=before, week_start=week_start,
+                )
+            resolver_no_filter.__annotations__ = annotations
+            return strawberry_django.field(
+                resolver=resolver_no_filter,
+                disable_optimization=True,
+            )
+
+        resolver.__annotations__ = annotations
+        return strawberry_django.field(
+            resolver=resolver, disable_optimization=True,
+        )
+
+    @staticmethod
+    def _validate_first_last(
+        first: int | None, last: int | None,
+    ) -> tuple[int | None, int | None]:
+        """Validate Relay-style ``first``/``last`` arguments.
+
+        - At most one may be set; both-set raises ``ValueError``.
+        - Negative values raise (Relay forbids them).
+        - When neither is set, returns ``(None, None)`` and the resolver
+          downgrades to "all rows in the page" — same as Relay's
+          default-page behaviour. Most consumers will pass ``first``.
+        """
+        if first is not None and last is not None:
+            raise ValueError(
+                "first and last are mutually exclusive on a Relay-"
+                "style cursor field. Pass one.",
+            )
+        if first is not None and first < 0:
+            raise ValueError(
+                f"first must be non-negative; got {first!r}.",
+            )
+        if last is not None and last < 0:
+            raise ValueError(
+                f"last must be non-negative; got {last!r}.",
+            )
+        return first, last
+
+    def _requested_aggregate_ops_grouped_connection(
+        self, info: Any, a_fields: list[str],
+        op_args: dict[str, dict[str, Any]] | None = None,
+    ) -> list[tuple[AggregateOp, str | None]]:
+        """Walk the connection-shaped selection set and emit the
+        ``(op, field)`` pairs the client asked for under
+        ``edges → node → {count, sum {…}, avg {…}}``.
+        """
+        requested: list[tuple[AggregateOp, str | None]] = [
+            (AggregateOp.COUNT, None),
+        ]
+        for sel in getattr(info, "selected_fields", []) or []:
+            for sub in sel.selections or []:
+                if getattr(sub, "name", None) != "edges":
+                    continue
+                for node_sel in sub.selections or []:
+                    if getattr(node_sel, "name", None) != "node":
+                        continue
+                    requested.extend(
+                        self._extract_ops_from_grouped(
+                            node_sel, a_fields, op_args=op_args,
+                        ),
+                    )
+        seen: set[tuple[Any, Any]] = set()
+        deduped: list[tuple[AggregateOp, str | None]] = []
+        for entry in requested:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            deduped.append(entry)
+        return deduped
+
+    def _cursor_values_for_row(
+        self,
+        row: dict[str, Any],
+        spec: list[tuple[str, Any]],
+        group_key_type: type,
+    ) -> list[Any]:
+        """Extract the canonical-order group-alias values from a row,
+        in the same shape :func:`encode_group_cursor` expects.
+        """
+        from strawberry_django_aggregates.compiler import (
+            group_by_alias as _gba,
+        )
+        out: list[Any] = []
+        for fp, grain in spec:
+            field = self.model._meta.get_field(fp)
+            alias = _gba(fp, grain, field)  # type: ignore[arg-type]
+            out.append(row.get(alias))
+        return out
+
+    def _cursor_paginated_rows(
+        self,
+        *,
+        qs: QuerySet,
+        spec: list[tuple[str, Any]],
+        requested: list[tuple[AggregateOp, str | None]],
+        having_dict: dict[str, Any],
+        op_args: dict[str, dict[str, Any]],
+        week_start: int,
+        after_vals: list[Any] | None,
+        before_vals: list[Any] | None,
+        page_size: int | None,
+        backward: bool,
+    ) -> list[dict[str, Any]]:
+        """Compile the aggregation queryset, apply the keyset filter
+        from ``after`` / ``before``, ORDER BY canonical aliases, and
+        slice ``page_size + 1`` rows for ``hasNextPage`` detection.
+
+        ``backward=True`` reverses the ORDER BY direction; the caller
+        un-reverses the materialized rows before encoding edges.
+        """
+        from django.conf import settings
+        from django.db import connections
+
+        from strawberry_django_aggregates.compiler import (
+            _build_aggregate_annotations,
+            _build_group_by_annotations,
+            _build_having_q,
+            _resolve_tzinfo,
+            _validate_postgres_only,
+        )
+
+        vendor = connections[qs.db].vendor
+        # Critical Rule 8: Postgres-only ops must raise at resolver
+        # entry, not mid-SQL. Same gate :func:`compute_aggregation`
+        # applies — duplicated here because the cursor field skips
+        # ``compute_aggregation`` entirely (we need the annotated
+        # queryset, not the materialized rows).
+        _validate_postgres_only(requested, vendor)
+        tzinfo = _resolve_tzinfo(settings.TIME_ZONE)
+
+        group_ann, group_aliases = _build_group_by_annotations(
+            qs.model, spec, tzinfo, week_start,
+        )
+        agg_ann = _build_aggregate_annotations(
+            qs.model, requested, vendor, op_args or {},
+        )
+
+        cqs = qs
+        if group_ann:
+            cqs = cqs.annotate(**group_ann)
+        cqs = cqs.values(*group_aliases).annotate(**agg_ann)
+
+        having_q = _build_having_q(having_dict, agg_ann.keys())
+        if having_q is not None:
+            cqs = cqs.filter(having_q)
+
+        # Keyset filters from after / before. ``after`` excludes the
+        # cursor row (forward); ``before`` excludes it (backward).
+        if after_vals is not None:
+            keyset_q = _keyset_filter(
+                group_aliases, after_vals, direction="gt",
+            )
+            if keyset_q is not None:
+                cqs = cqs.filter(keyset_q)
+        if before_vals is not None:
+            keyset_q = _keyset_filter(
+                group_aliases, before_vals, direction="lt",
+            )
+            if keyset_q is not None:
+                cqs = cqs.filter(keyset_q)
+
+        if backward:
+            cqs = cqs.order_by(*[f"-{a}" for a in group_aliases])
+        else:
+            cqs = cqs.order_by(*group_aliases)
+
+        # Fetch ``page_size + 1`` rows so the resolver can detect a
+        # next page. ``page_size`` is ``None`` when the caller passed
+        # neither ``first`` nor ``last`` — fall back to a sensible-
+        # but-bounded default to avoid accidental "load every group"
+        # queries; the Relay connection spec permits a default.
+        if page_size is None or page_size <= 0:
+            cqs = cqs[:101]  # default cap; resolver trims
+        else:
+            cqs = cqs[:page_size + 1]
+
+        return list(cqs)
 
     @staticmethod
     def _resolve_week_start(value: Any) -> int:
@@ -1065,7 +1483,15 @@ class AggregateBuilder:
 
 @dataclass
 class BuiltAggregates:
-    """Output of :meth:`AggregateBuilder.build`."""
+    """Output of :meth:`AggregateBuilder.build`.
+
+    ``grouped_connection_type`` / ``grouped_connection_edge_type`` /
+    ``page_info_type`` / ``grouped_connection_field`` are populated only
+    when ``pagination_style`` was ``"cursor"`` or ``"both"`` — they
+    remain ``None`` for the default ``"offset"`` style. ``group_by_field``
+    is populated for ``"offset"`` and ``"both"`` and ``None`` for
+    ``"cursor"`` (which replaces it with the connection field).
+    """
 
     aggregate_type:       type
     grouped_type:         type
@@ -1076,6 +1502,10 @@ class BuiltAggregates:
     groupable_field_enum: type
     aggregate_field:      Any
     group_by_field:       Any
+    grouped_connection_type:      type | None = None
+    grouped_connection_edge_type: type | None = None
+    page_info_type:               type | None = None
+    grouped_connection_field:     Any        = None
 
 
 # ---------------------------------------------------------------------------
@@ -1143,3 +1573,54 @@ def _unwrap_optional(annotation: Any) -> Any:
         if len(args) == 1:
             return args[0]
     return annotation
+
+
+def _keyset_filter(
+    aliases: list[str],
+    values: list[Any],
+    *,
+    direction: str,
+) -> Any | None:
+    """Build a tuple-comparison Q expression equivalent to
+    ``(a, b, c) > (av, bv, cv)`` (forward, ``direction="gt"``) or
+    ``< (...)`` (backward, ``direction="lt"``).
+
+    Without row-constructor support in Django ORM, the tuple
+    comparison is unrolled into a disjunction of conjunctions::
+
+        Q(a__gt=av)
+        | (Q(a=av) & Q(b__gt=bv))
+        | (Q(a=av) & Q(b=bv) & Q(c__gt=cv))
+
+    ``aliases`` and ``values`` must be the same length; mismatched
+    cursors (e.g. user passes a stale cursor with a different
+    group_by spec) silently produce no rows because the conjunction
+    cannot be satisfied — that is the intended fail-soft behaviour
+    for an opaque cursor whose contents are an internal contract.
+
+    Returns ``None`` when ``aliases`` is empty (a cursor over an
+    empty group_by makes no sense; the caller should never reach
+    here, but failing soft is preferred to crashing).
+
+    NULL handling: SQL ``>`` / ``<`` against NULL is unknown; the
+    resulting filter omits rows where ANY group alias is NULL.
+    Strict but predictable; documented behaviour.
+    """
+    from django.db.models import Q
+
+    if not aliases or len(aliases) != len(values):
+        return None
+
+    op = "gt" if direction == "gt" else "lt"
+    clauses: list[Q] = []
+    for i, alias in enumerate(aliases):
+        # Build Q(prefix=) AND Q(alias__op=values[i]).
+        prefix = Q()
+        for j in range(i):
+            prefix &= Q(**{aliases[j]: values[j]})
+        clauses.append(prefix & Q(**{f"{alias}__{op}": values[i]}))
+
+    combined: Q | None = None
+    for c in clauses:
+        combined = c if combined is None else combined | c
+    return combined

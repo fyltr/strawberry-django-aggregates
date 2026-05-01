@@ -25,6 +25,12 @@ Public surface:
 - :func:`generate_bucket_spine` + :func:`fill_bucket_results` —
   empty-bucket filling helpers powering ``compute_aggregation(fill=True)``
   (SPEC § 7.2). Pure stdlib; callable from any Python context.
+- :func:`encode_group_cursor` + :func:`decode_group_cursor` — opaque
+  cursor encoding for Relay-style grouped pagination (SPEC § 4
+  cursor-pagination). Pure stdlib; the same encoding is used by the
+  builder's connection field.
+- :func:`make_grouped_connection_type` — emit Relay-style
+  ``<Model>GroupedConnection`` / ``<Model>GroupedEdge`` types.
 - Errors: :class:`AggregateError`, :class:`OperatorNotSupportedError`,
   :class:`OrderFieldNotAllowed`, :class:`AggregationAcrossRelationError`.
 
@@ -61,11 +67,16 @@ from strawberry_django_aggregates.ordering import (
     comodel_ordering_terms,
     parse_aggregate_order,
 )
+from strawberry_django_aggregates.pagination import (
+    decode_group_cursor,
+    encode_group_cursor,
+)
 from strawberry_django_aggregates.types import (
     BigInt,
     BucketRange,
     make_aggregate_type,
     make_group_by_spec,
+    make_grouped_connection_type,
     make_grouped_type,
     make_having_input,
 )
@@ -78,6 +89,7 @@ __all__ = [
     # Type generators
     "make_aggregate_type",
     "make_grouped_type",
+    "make_grouped_connection_type",
     "make_having_input",
     "make_group_by_spec",
     # Backend primitive
@@ -98,6 +110,10 @@ __all__ = [
     # results (SPEC § 7.2 / Stream 7).
     "fill_bucket_results",
     "generate_bucket_spine",
+    # Cursor pagination — opaque base64 / JSON encoding over the
+    # canonical-order group-by alias values (SPEC § 4 / Stream 11).
+    "encode_group_cursor",
+    "decode_group_cursor",
     # Ordering
     "parse_aggregate_order",
     "comodel_ordering_terms",

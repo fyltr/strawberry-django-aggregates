@@ -11,6 +11,9 @@ Public surface:
   types.
 - :func:`make_grouped_type` — emits ``<Model>GroupKey``,
   ``<Model>Grouped``, and ``<Model>GroupedResult``.
+- :func:`make_grouped_connection_type` — emits Relay-style
+  ``<Model>GroupedConnection`` / ``<Model>GroupedEdge`` / ``PageInfo``
+  for cursor-paginated grouped results (SPEC § 4 cursor-pagination).
 - :func:`make_having_input` — emits ``<Model>Having``.
 - :func:`make_group_by_spec` — emits ``<Model>GroupBySpec`` plus the
   groupable-field enum.
@@ -992,3 +995,71 @@ def make_group_order_input(
         ],
     )
     return _input_decorator(enable_federation)(cls)
+
+
+# ---------------------------------------------------------------------------
+# make_grouped_connection_type — Relay-style cursor pagination (SPEC § 4)
+# ---------------------------------------------------------------------------
+#
+# Emitted alongside (or instead of) ``<Model>GroupedResult`` when the
+# builder is configured with ``pagination_style`` of ``"cursor"`` or
+# ``"both"``. Default remains ``"offset"`` so existing consumers see no
+# SDL change (CLAUDE.md Critical Rule 2 — determinism for unchanged
+# inputs).
+
+def make_grouped_connection_type(
+    model: type[Model],
+    *,
+    name: str | None = None,
+    grouped_type: type,
+    enable_federation: bool = False,
+) -> tuple[type, type, type]:
+    """Build ``<Model>GroupedEdge``, the ``PageInfo`` re-export, and
+    ``<Model>GroupedConnection`` types for Relay-style cursor pagination.
+
+    Returns ``(edge_type, page_info_type, connection_type)``.
+
+    The connection has ``edges: [<Model>GroupedEdge!]!``,
+    ``pageInfo: PageInfo!``, ``totalCount: Int!``. Each edge carries a
+    ``cursor: String!`` (opaque base64-encoded JSON of the canonical
+    group-by alias values — see :mod:`pagination`) and a ``node:
+    <Model>Grouped!``.
+
+    The library re-exports :class:`strawberry.relay.PageInfo` rather
+    than defining a duplicate ``PageInfo`` type — Strawberry already
+    canonicalizes the shape (``hasNextPage``, ``hasPreviousPage``,
+    ``startCursor``, ``endCursor``) and reusing the existing type
+    keeps the federation / introspection story consistent for
+    consumers who already use Relay elsewhere in their schema.
+
+    When ``enable_federation=True`` the edge and connection types
+    are decorated with :func:`strawberry.federation.type` for
+    consistency with the rest of the aggregate emission. The PageInfo
+    re-export is always Strawberry's standard
+    :class:`strawberry.relay.PageInfo` (federation-compatible by
+    construction; the ``@key``-less default suits an aggregate-only
+    container).
+    """
+    from strawberry.relay import PageInfo
+
+    name = name or model.__name__
+    decorator = _type_decorator(enable_federation)
+
+    edge_cls = decorator(_make_dataclass(
+        f"{name}GroupedEdge",
+        [
+            ("cursor", str, dataclasses.MISSING),
+            ("node", grouped_type, dataclasses.MISSING),
+        ],
+    ))
+
+    connection_cls = decorator(_make_dataclass(
+        f"{name}GroupedConnection",
+        [
+            ("edges", list[edge_cls], dataclasses.MISSING),  # type: ignore[valid-type]
+            ("page_info", PageInfo, dataclasses.MISSING),
+            ("total_count", int, 0),
+        ],
+    ))
+
+    return edge_cls, PageInfo, connection_cls

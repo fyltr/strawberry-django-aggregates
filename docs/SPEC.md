@@ -24,7 +24,7 @@ This spec is the contract. It mirrors Odoo 18's `_read_group` semantics where th
 - Cross-database aggregation. PostgreSQL + SQLite only. Postgres-only operators (`array_agg`, `string_agg`, `stddev`, `variance`) raise `OperatorNotSupportedError` at resolver entry on SQLite.
 - Auto-traversal of one-to-many / many-to-many relations for measures. Silent row multiplication corrupts every measure in the same query — Odoo refuses this and so do we. `array_agg` is the explicit escape hatch.
 - Permission integration. The library expects a pre-scoped queryset; the caller has already applied `accessible_by(user)` or `filter(owner=request.user)`. This keeps it compatible with django-guardian, django-rules, [django-rebac](#) (when published), or hand-rolled permission systems.
-- Cursor pagination on grouped results. Offset only.
+- Cursor pagination on grouped results was deferred in early drafts; v1.0 ships an opt-in Relay-style connection alongside the offset shape. See § 4 cursor-pagination.
 - Aggregation-of-relation as a top-level field on the parent (e.g. `order.itemsAggregate`). Use a top-level `<child>Aggregate(filter: { parent: { id: $id } })` query on the child model instead.
 
 ## 2 · Why a separate library
@@ -159,6 +159,71 @@ enum Granularity {
 ```
 
 **Flat-result design.** No recursive `subgroups: [OrderGrouped!]` field. Pagination of trees is hellish; pagination of flat lists is trivial. Multi-level `group_by` produces multiple result rows; client-side folding for tree UIs is the caller's job. This matches Odoo's `_read_group` return shape (`list[tuple]` with composite keys) and PostGraphile's `groupedAggregates`.
+
+### 4.1 · Cursor pagination on grouped results
+
+The default offset paginator (`<Model>GroupedResult { results, pageInfo, totalCount }`) is sufficient for analytics dashboards that fit on a single page. Long-tail group cardinality (thousands of customers, daily-bucketed years of data) wants Relay-style cursor pagination: no `count(*)` on every page, stable cursors that survive new-row insertions, infinite-scroll wire shape JS clients already speak.
+
+`AggregateBuilder` accepts an opt-in `pagination_style` argument:
+
+| Value | Field name | Return type |
+| --- | --- | --- |
+| `"offset"` (default) | `<model>GroupBy` | `<Model>GroupedResult` |
+| `"cursor"` | `<model>GroupBy` | `<Model>GroupedConnection` |
+| `"both"` | `<model>GroupBy` (offset) and `<model>GroupByConnection` (cursor) | both |
+
+The default is `"offset"` so existing consumers see byte-identical SDL — Critical Rule 2 (determinism) holds for unchanged inputs.
+
+```graphql
+type OrderGroupedConnection {
+  edges:      [OrderGroupedEdge!]!
+  pageInfo:   PageInfo!
+  totalCount: Int!
+}
+
+type OrderGroupedEdge {
+  cursor: String!
+  node:   OrderGrouped!
+}
+
+type PageInfo {
+  hasNextPage:     Boolean!
+  hasPreviousPage: Boolean!
+  startCursor:     String
+  endCursor:       String
+}
+```
+
+`PageInfo` is the standard `strawberry.relay.PageInfo` re-export — no library-specific duplicate. Same shape as the rest of the consumer's Relay surface.
+
+**Connection arguments.** `first: Int`, `after: String`, `last: Int`, `before: String` (Relay convention; `first` and `last` mutually exclusive, both non-negative). Plus `groupBy`, `having`, `weekStart`, and `filter` (when wired) for parity with the offset field. Out of scope on the cursor field for v1.0: `orderBy` (would break keyset semantics — the canonical group-alias ordering is forced for stability) and `fill` (the dense spine has no obvious cursor encoding for filler buckets — use the offset variant).
+
+**Cursor format.** Opaque base64-URL-safe encoding of a JSON list of group-by alias values in canonical order — the same order the caller supplies in `group_by` (mirrors `compiler.group_by_alias`). Datetimes / dates / times serialize as ISO-8601 strings tagged with one-letter type markers (`["dt", "2026-05-01T00:00:00+00:00"]`); `Decimal` survives via a `["dec", "100.00"]` tag. Pure stdlib (`base64`, `json`, `datetime`, `decimal`) — no Django, no Strawberry. The encoder is deterministic: same input ⇒ byte-identical output.
+
+```python
+from strawberry_django_aggregates import (
+    encode_group_cursor, decode_group_cursor,
+)
+
+cursor = encode_group_cursor([42, "paid", datetime(2026, 5, 1, tzinfo=UTC)])
+# → "WyA0Mi..." (opaque)
+decode_group_cursor(cursor)
+# → [42, "paid", datetime(2026, 5, 1, tzinfo=UTC)]
+```
+
+**Keyset semantics.** Forward pagination (`after`) translates to `(a, b, c) > (cursor_a, cursor_b, cursor_c)` over the canonical group aliases; backward pagination (`before`) is the symmetric `< (...)`. Django ORM has no row-constructor support, so the tuple comparison is unrolled into the standard disjunction-of-conjunctions:
+
+```
+Q(a__gt=av) | (Q(a=av) & Q(b__gt=bv)) | (Q(a=av) & Q(b=bv) & Q(c__gt=cv))
+```
+
+This works uniformly for single-level (`group_by=[("customer", None)]`) and multi-level (`group_by=[("customer", None), ("status", None), ("created_at", MONTH)]`) — v1.0 supports both. The keyset filter applies to the annotated/values queryset, so date-bucketed columns compare against their truncated bucket boundary (`created_at_month >= 2026-06-01`), not the underlying timestamp. NULL handling is strict — SQL three-valued logic excludes any row where a group alias is NULL from the comparison; this is documented behaviour, not a footgun.
+
+**`hasNextPage` detection.** The resolver fetches `page_size + 1` rows and trims the trailing extra before encoding edges; the extra row's presence drives `hasNextPage` (forward) or `hasPreviousPage` (backward). The other side of the page-info pair is set from the cursor presence: `after` set ⇒ `hasPreviousPage=true` (forward pagination), `before` set ⇒ `hasNextPage=true` (backward pagination).
+
+**`totalCount`.** Same DB-side `COUNT(DISTINCT ...)` path as the offset field's `totalCount` — no Python-side row materialization. The count reflects the post-`having` group cardinality and ignores `first`/`last`/`after`/`before` (the page is a window over the total).
+
+**Determinism.** `pagination_style="offset"` (default) emits byte-identical SDL to pre-Stream-11 builds — the determinism test passes unchanged. `pagination_style="cursor"` and `pagination_style="both"` produce stable SDL across two generations of the same builder (Critical Rule 2). The cursor encoding is also stable across Python versions and operating systems (no timestamps, no PRNG, no insertion-order dependence).
 
 ## 5 · Aggregate operator vocabulary
 
@@ -882,7 +947,7 @@ tests/
 
 ## 15 · What this spec doesn't decide
 
-- **Cursor pagination on grouped results.** Offset only for v1.
+- **Cursor pagination on grouped results.** Offset only in early drafts; v1.0 ships an opt-in Relay-style connection alongside the offset shape (§ 4 cursor-pagination).
 - **Aggregate-of-relation as a parent field** (e.g. `order.itemsAggregate`). Would need a `Subquery` emission strategy. Documented alternative (top-level child query) covers most cases. Possible v2.
 - **Apollo Federation v2 first-class wiring.** v1.0 ships an opt-in `enable_federation` flag on `AggregateBuilder` that emits `@external` on `<Model>GroupKey` FK fields and decorates emitted types with `strawberry.federation.type`. Full `@key` / `@requires` / `@provides` semantics are deferred — see § 18.
 - **Window functions** (`ROW_NUMBER`, `RANK`, `LAG`, etc.). Adjacent feature space; would need a new `<Model>Windowed` shape. Out of scope.
