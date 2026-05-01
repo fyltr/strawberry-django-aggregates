@@ -118,10 +118,17 @@ type OrderGroupedResult {
 }
 
 type OrderGroupKey {
-  customerId:  ID
-  status:      OrderStatusEnum
-  createdAt:   DateTime          # bucketed if granularity arg used
-  dayOfWeek:   Int               # populated when bucketed via NumberGranularity
+  customerId:       ID
+  status:           OrderStatusEnum
+  createdAt:        DateTime      # bucketed if granularity arg used
+  createdAtMonth:   DateTime      # populated when groupBy uses MONTH granularity
+  createdAtMonthRange: BucketRange  # half-open [from, to) sibling — TIME granularity only
+  dayOfWeek:        Int           # populated when bucketed via NumberGranularity
+}
+
+type BucketRange {
+  from: DateTime!                 # inclusive bucket start
+  to:   DateTime!                 # exclusive bucket end (next bucket's start)
 }
 
 input OrderGroupBySpec {
@@ -464,6 +471,38 @@ class NumberGranularity(StrEnum):
 ```
 
 The NUMBER track is the canonical way to ask "orders per day-of-week" or "signups per hour-of-day across all dates" (cohort/heatmap analytics). Odoo learned this in 17.3 (PR #159528) and we ship it day-1.
+
+### Bucket range siblings — `<field>_<granularity>_range`
+
+For each TIME-granularity bucket in `group_by`, the emitted `<Model>GroupKey`
+carries a sibling `<field>_<granularity>_range: BucketRange { from: DateTime!, to: DateTime! }`
+half-open interval. `from` is inclusive, `to` is exclusive (the start of
+the next bucket). The interval is computed in the resolver from the
+bucketed value plus the granularity — no extra SQL — and shares the
+bucketed value's `tzinfo`, so a `tz="Asia/Tokyo"` query returns
+Tokyo-local boundaries (e.g. `2026-05-01 00:00+09:00` →
+`2026-06-01 00:00+09:00`).
+
+NUMBER granularity (`DAY_OF_WEEK`, `MONTH_NUMBER`, etc.) is degenerate
+— there is no contiguous range for "all Tuesdays" — and gets no range
+sibling.
+
+#### `bucket_range(value, granularity)` — backend primitive
+
+The same arithmetic is exposed as a public helper for callers outside
+the GraphQL resolver:
+
+```python
+from strawberry_django_aggregates import TimeGranularity, bucket_range
+
+bucket_range(datetime(2026, 5, 1, tzinfo=UTC), TimeGranularity.MONTH)
+# → (datetime(2026, 5, 1, tzinfo=UTC), datetime(2026, 6, 1, tzinfo=UTC))
+```
+
+Pure stdlib, no Django / Strawberry imports — callable from any Python
+context (DRF view, Celery task, MCP tool, plain `manage.py shell`).
+Lives in `compiler.py` to honour CLAUDE.md Critical Rule 9 (no GraphQL
+coupling on the framework-agnostic primitives).
 
 ### Timezone correctness
 

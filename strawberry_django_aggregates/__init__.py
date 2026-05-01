@@ -19,6 +19,9 @@ Public surface:
 - :data:`BigInt` — string-encoded 64-bit signed integer scalar. Output
   type for ``SUM`` over integer Django fields (Postgres widens to
   ``bigint``; the 32-bit GraphQL ``Int`` would silently overflow).
+- :class:`BucketRange` + :func:`bucket_range` — half-open ``[from, to)``
+  interval emitted as a sibling on ``<Model>GroupKey`` for each
+  TIME-granularity bucket (SPEC § 7).
 - Errors: :class:`AggregateError`, :class:`OperatorNotSupportedError`,
   :class:`OrderFieldNotAllowed`, :class:`AggregationAcrossRelationError`.
 
@@ -28,7 +31,10 @@ See ``docs/SPEC.md`` for the full contract.
 from __future__ import annotations
 
 from strawberry_django_aggregates.builder import AggregateBuilder
-from strawberry_django_aggregates.compiler import compute_aggregation
+from strawberry_django_aggregates.compiler import (
+    bucket_range,
+    compute_aggregation,
+)
 from strawberry_django_aggregates.errors import (
     AggregateError,
     AggregationAcrossRelationError,
@@ -49,6 +55,7 @@ from strawberry_django_aggregates.ordering import (
 )
 from strawberry_django_aggregates.types import (
     BigInt,
+    BucketRange,
     make_aggregate_type,
     make_group_by_spec,
     make_grouped_type,
@@ -74,6 +81,10 @@ __all__ = [
     "default_operators_for",
     # Custom scalars
     "BigInt",
+    # Bucket range — half-open [from, to) interval for TIME-granularity
+    # group-by buckets (SPEC § 7 / Stream 5).
+    "BucketRange",
+    "bucket_range",
     # Ordering
     "parse_aggregate_order",
     "comodel_ordering_terms",

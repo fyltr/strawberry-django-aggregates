@@ -15,6 +15,7 @@ modules only — never from ``strawberry`` or ``strawberry_django``.
 
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
@@ -107,6 +108,80 @@ _NUMBER_LOOKUP: dict[NumberGranularity, str] = {
     NumberGranularity.SECOND_NUMBER:   "second",
     # DAY_OF_YEAR uses a custom Func below (Django has no builtin).
 }
+
+
+# ---------------------------------------------------------------------------
+# Bucket-range helper — half-open [from, to) interval for a TIME bucket.
+# ---------------------------------------------------------------------------
+#
+# Pure-stdlib. NO Django, NO Strawberry imports. Lives here because
+# Stream 5's design has it as a shared helper imported by both the
+# resolver (in ``builder.py``) and any future caller — see CLAUDE.md
+# Critical Rule 9: ``compiler.py`` stays framework-agnostic.
+#
+# The input ``value`` is a bucketed datetime — i.e. the result of a
+# ``date_trunc(<granularity>, ts)`` already in the user's tz. The
+# returned ``[from, to)`` interval is computed in the value's own
+# tzinfo so callers querying with ``tz="Asia/Tokyo"`` see Tokyo-local
+# boundaries (e.g. ``2026-05-01 00:00+09:00`` → ``2026-06-01 00:00+09:00``).
+#
+# Manual stdlib month arithmetic is used (no ``dateutil.relativedelta``
+# dependency) — it's a couple of lines and keeps the dep list tight.
+
+def _add_months(value: datetime.datetime, months: int) -> datetime.datetime:
+    """Add ``months`` to ``value`` preserving day=1 / time-of-day.
+
+    Used for YEAR / QUARTER / MONTH bucket boundaries — the input
+    has already been ``date_trunc``'d so day == 1 and the time-of-day
+    is 00:00:00 (in the value's tz). We therefore don't need the
+    Odoo-style "clamp day to month length" logic.
+    """
+    total = value.month - 1 + months
+    new_year = value.year + total // 12
+    new_month = total % 12 + 1
+    return value.replace(year=new_year, month=new_month)
+
+
+def bucket_range(
+    value: datetime.datetime,
+    granularity: TimeGranularity,
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """Compute the half-open ``[from, to)`` interval for a bucketed
+    datetime ``value`` at the given ``granularity``.
+
+    ``value`` is expected to be the truncated bucket boundary itself
+    (already aligned to the start of its bucket in its own tzinfo).
+    ``from_`` is returned as ``value`` unchanged; ``to`` is the start
+    of the next bucket. Both share the same ``tzinfo``.
+
+    Examples (all in the value's tzinfo):
+
+    - ``bucket_range(2026-05-01 00:00, MONTH)`` →
+      ``(2026-05-01 00:00, 2026-06-01 00:00)``
+    - ``bucket_range(2026-05-04 00:00, WEEK)`` (Mon-start) →
+      ``(2026-05-04 00:00, 2026-05-11 00:00)``
+    - ``bucket_range(2026-05-01 14:00, HOUR)`` →
+      ``(2026-05-01 14:00, 2026-05-01 15:00)``
+    """
+    if granularity is TimeGranularity.YEAR:
+        return value, _add_months(value, 12)
+    if granularity is TimeGranularity.QUARTER:
+        return value, _add_months(value, 3)
+    if granularity is TimeGranularity.MONTH:
+        return value, _add_months(value, 1)
+    if granularity is TimeGranularity.WEEK:
+        return value, value + datetime.timedelta(days=7)
+    if granularity is TimeGranularity.DAY:
+        return value, value + datetime.timedelta(days=1)
+    if granularity is TimeGranularity.HOUR:
+        return value, value + datetime.timedelta(hours=1)
+    if granularity is TimeGranularity.MINUTE:
+        return value, value + datetime.timedelta(minutes=1)
+    if granularity is TimeGranularity.SECOND:
+        return value, value + datetime.timedelta(seconds=1)
+    raise ValueError(  # defensive — exhaustive over TimeGranularity
+        f"Unknown TimeGranularity {granularity!r}.",
+    )
 
 
 class _ExtractDayOfYear(TimezoneMixin, Func):
