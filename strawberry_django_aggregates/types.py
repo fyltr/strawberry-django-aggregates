@@ -449,6 +449,23 @@ def make_aggregate_type(
                 op.value, nested_types[op] | None, None,
             ))
 
+    # SQL-standard aliases — `every` is the SQL spelling of BOOL_AND,
+    # `some` of BOOL_OR. Per Stream 4 we expose them as wire-level
+    # aliases (no new AggregateOp member) that share the same nested
+    # type instances as `bool_and` / `bool_or`. The selection walker
+    # in `builder.py` translates these names back to BOOL_AND / BOOL_OR
+    # before reaching the compiler. Appended AFTER `bool_and` /
+    # `bool_or` so the canonical-order tuple in CLAUDE.md Critical Rule
+    # 2 remains stable for the underlying ops.
+    if AggregateOp.BOOL_AND in nested_types:
+        aggregate_dc_fields.append((
+            "every", nested_types[AggregateOp.BOOL_AND] | None, None,
+        ))
+    if AggregateOp.BOOL_OR in nested_types:
+        aggregate_dc_fields.append((
+            "some", nested_types[AggregateOp.BOOL_OR] | None, None,
+        ))
+
     cls = _make_dataclass(f"{name}Aggregate", aggregate_dc_fields)
 
     # count_distinct is a method-style field (takes a `field` argument)
@@ -728,6 +745,19 @@ def make_grouped_type(
             grouped_dc_fields.append(
                 (op.value, nested_types[op] | None, None),
             )
+    # `every` / `some` SQL-standard aliases — same shape as on
+    # `<Model>Aggregate`. See the comment in :func:`make_aggregate_type`
+    # for the rationale; both fields share the underlying BOOL_AND /
+    # BOOL_OR nested-type instance and are populated alongside their
+    # canonical siblings in :func:`AggregateBuilder._build_nested_op_kwargs`.
+    if AggregateOp.BOOL_AND in nested_types:
+        grouped_dc_fields.append((
+            "every", nested_types[AggregateOp.BOOL_AND] | None, None,
+        ))
+    if AggregateOp.BOOL_OR in nested_types:
+        grouped_dc_fields.append((
+            "some", nested_types[AggregateOp.BOOL_OR] | None, None,
+        ))
     decorator = _type_decorator(enable_federation)
     grouped_cls = decorator(_make_dataclass(
         f"{name}Grouped", grouped_dc_fields,

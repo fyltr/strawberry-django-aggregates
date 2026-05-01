@@ -71,14 +71,31 @@ def _to_camel(snake: str) -> str:
 # GraphQL camelCase wire-name → AggregateOp. Used by the resolver to
 # walk ``info.selected_fields`` and figure out which (op, field) pairs
 # to ask the compiler for.
+#
+# Includes SQL-standard aliases ``every`` ≡ ``bool_and`` and
+# ``some`` ≡ ``bool_or`` (Stream 4). These are wire-only — no new
+# :class:`AggregateOp` member is introduced; the canonical enum stays
+# stable. See SPEC § 5.
 _OP_FROM_WIRE: dict[str, AggregateOp] = {
     _to_camel(op.value): op for op in AggregateOp
 }
+_OP_FROM_WIRE["every"] = AggregateOp.BOOL_AND
+_OP_FROM_WIRE["some"] = AggregateOp.BOOL_OR
+
 # Guard against a future operator whose camelCased name collides with
-# an existing one (would silently shadow a member in `_OP_FROM_WIRE`).
-assert len(_OP_FROM_WIRE) == len(AggregateOp), (
-    "Two AggregateOp members camelCase to the same wire name."
-)
+# an existing one (would silently shadow a member in
+# ``_OP_FROM_WIRE``). Iterate the source-of-truth enum and assert each
+# camelCased name maps back to itself; aliases (``every`` / ``some``)
+# are validated separately so the count check tolerates wire-level
+# aliases without losing collision detection.
+for _op in AggregateOp:
+    assert _OP_FROM_WIRE.get(_to_camel(_op.value)) is _op, (
+        f"AggregateOp member {_op!r} camelCases to a name that "
+        f"collides with another entry in _OP_FROM_WIRE."
+    )
+assert _OP_FROM_WIRE["every"] is AggregateOp.BOOL_AND
+assert _OP_FROM_WIRE["some"] is AggregateOp.BOOL_OR
+del _op
 
 
 # ---------------------------------------------------------------------------
@@ -1027,7 +1044,22 @@ class AggregateBuilder:
             if nested_type_field is None:
                 continue
             nested_type = _unwrap_optional(nested_type_field.type)
-            out[nested_attr] = nested_type(**fields_dict)
+            instance = nested_type(**fields_dict)
+            out[nested_attr] = instance
+            # SQL-standard wire aliases (Stream 4): ``every`` mirrors
+            # ``bool_and`` and ``some`` mirrors ``bool_or``. The owner
+            # type only declares these fields when its allowlist
+            # admits BOOL_AND / BOOL_OR, so we guard with a field
+            # presence check before assigning. Both aliases share the
+            # SAME nested-type instance — no duplicate construction.
+            if op is AggregateOp.BOOL_AND and any(
+                f.name == "every" for f in dataclasses.fields(owner_type)
+            ):
+                out["every"] = instance
+            elif op is AggregateOp.BOOL_OR and any(
+                f.name == "some" for f in dataclasses.fields(owner_type)
+            ):
+                out["some"] = instance
         return out
 
 
