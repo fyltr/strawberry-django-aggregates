@@ -90,6 +90,8 @@ type OrderAggregate {
   variance:        OrderVarianceFields  # Postgres only
   boolAnd:         OrderBoolAndFields   # for boolean fields
   boolOr:          OrderBoolOrFields    # for boolean fields
+  every:           OrderBoolAndFields   # SQL-standard alias for boolAnd
+  some:            OrderBoolOrFields    # SQL-standard alias for boolOr
   arrayAgg:        OrderArrayAggFields  # Postgres only — returns ID/string lists
   stringAgg:       OrderStringAggFields # Postgres only
 }
@@ -207,6 +209,20 @@ Direct mapping to SQL — no operator outside this enum reaches the database:
 **`BigInt` for integer-field SUM.** Postgres widens `SUM(int_col)` to 8-byte `bigint`, which overflows the 32-bit GraphQL `Int` scalar (max 2³¹ − 1 ≈ 2.1 billion). Even `bigint`-fitting values escape the JavaScript `Number` safe range past 2⁵³ ≈ 9 × 10¹⁵. We emit a custom `BigInt` scalar that serializes as a JSON string on the wire so JS/TS clients survive end-to-end without precision loss; clients re-parse with `BigInt()` (TS) or `int()` (Python). The same scalar applies whether the underlying field is `IntegerField`, `SmallIntegerField`, `PositiveIntegerField`, `PositiveSmallIntegerField`, or `BigIntegerField`.
 
 **`array_agg` returns IDs only — never auto-hydrated.** Odoo's `recordset` operator browse-resolves to live records and is a serialization landmine in GraphQL (think: 10000 element arrays expanded into nested objects on every group). We refuse the auto-hydration. Clients refetch by ID and Strawberry's `DjangoOptimizerExtension` batches the lookup.
+
+**SQL-standard `every` / `some` aliases.** SQL:1999 names the boolean
+aggregates `every(col)` and `some(col)` (with `bool_and` / `bool_or` as
+PostgreSQL aliases for the same functions). For wire-level
+familiarity, `<Model>Aggregate` and `<Model>Grouped` expose `every:
+<Model>BoolAndFields` and `some: <Model>BoolOrFields` as siblings of
+`boolAnd` / `boolOr`. The aliases are pure wire surface — no new
+`AggregateOp` member, no new SQL emission, no new nested type. The
+selection walker translates `every` → `BOOL_AND` and `some` →
+`BOOL_OR` before reaching the compiler; the result-shaping code
+populates both the canonical and alias dataclass attributes from the
+same value. Clients may select either name (or both — they return
+identical payloads). The alias fields are absent when the model
+allowlist excludes BOOL_AND / BOOL_OR (no boolean fields in scope).
 
 ### Per-field-type defaults
 
