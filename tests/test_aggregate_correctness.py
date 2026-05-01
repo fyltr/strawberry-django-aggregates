@@ -382,3 +382,75 @@ def test_bigint_exported_from_package_root(db):
     assert definition.name == "BigInt"
     assert definition.serialize is str
     assert definition.parse_value is int
+
+
+# ---------------------------------------------------------------------------
+# Population stddev / variance — Stream 3.
+#
+# ``stddev_pop`` and ``var_pop`` are PG-only (raise on SQLite at resolver
+# entry — covered in test_postgres_only_ops.py). The math correctness
+# tests below run against PostgreSQL only and skip on SQLite. The
+# expected values are computed with population formulas (ddof=0):
+#
+#     var_pop  = sum((x - mean)**2) / N
+#     stddev_pop = sqrt(var_pop)
+#
+# Fixture totals: [100, 200, 300, 50, 75, 400] (Decimal). Population
+# variance computed on the float-cast values; we tolerate small float
+# rounding (rel=1e-6).
+# ---------------------------------------------------------------------------
+
+
+def _expected_pop_stats(values: list[float]) -> tuple[float, float]:
+    """Return ``(var_pop, stddev_pop)`` for ``values``.
+
+    Computed inline (no numpy dep) using the standard population
+    formulas: divide by ``N``, not ``N - 1``.
+    """
+    n = len(values)
+    mean = sum(values) / n
+    var_pop = sum((x - mean) ** 2 for x in values) / n
+    return var_pop, var_pop ** 0.5
+
+
+@pytest.mark.django_db
+def test_stddev_pop_var_pop_correctness(sample_orders):
+    """STDDEV_POP / VAR_POP return population statistics on PG.
+
+    Skips on SQLite (caught by test_postgres_only_ops.py).
+    """
+    from django.db import connection
+
+    if connection.vendor != "postgresql":
+        pytest.skip("STDDEV_POP / VAR_POP are PG-only (SPEC § 5).")
+
+    from tests.models import Order
+
+    rows = compute_aggregation(
+        Order.objects.all(),
+        aggregates=[
+            (AggregateOp.STDDEV_POP, "total"),
+            (AggregateOp.VAR_POP, "total"),
+            # Sanity: sample variants on the same fixture, so the test
+            # also documents the population-vs-sample divergence.
+            (AggregateOp.STDDEV, "total"),
+            (AggregateOp.VARIANCE, "total"),
+        ],
+    )
+    assert len(rows) == 1
+    row = rows[0]
+
+    fixture_totals = [100.0, 200.0, 300.0, 50.0, 75.0, 400.0]
+    expected_var_pop, expected_stddev_pop = _expected_pop_stats(
+        fixture_totals,
+    )
+    assert row["var_pop_total"] == pytest.approx(
+        expected_var_pop, rel=1e-6,
+    )
+    assert row["stddev_pop_total"] == pytest.approx(
+        expected_stddev_pop, rel=1e-6,
+    )
+    # Sample variance uses N-1, so it MUST be strictly larger than
+    # population variance for this fixture (N=6, all-non-null).
+    assert row["variance_total"] > row["var_pop_total"]
+    assert row["stddev_total"] > row["stddev_pop_total"]

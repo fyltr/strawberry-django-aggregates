@@ -161,6 +161,8 @@ _FIELD_OPERATORS: tuple[AggregateOp, ...] = (
     AggregateOp.MAX,
     AggregateOp.STDDEV,
     AggregateOp.VARIANCE,
+    AggregateOp.STDDEV_POP,
+    AggregateOp.VAR_POP,
     AggregateOp.BOOL_AND,
     AggregateOp.BOOL_OR,
     AggregateOp.ARRAY_AGG,
@@ -253,7 +255,12 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
         if type(field).__name__ == "DecimalField":
             return decimal.Decimal
         return float
-    if op in {AggregateOp.STDDEV, AggregateOp.VARIANCE}:
+    if op in {
+        AggregateOp.STDDEV,
+        AggregateOp.VARIANCE,
+        AggregateOp.STDDEV_POP,
+        AggregateOp.VAR_POP,
+    }:
         return float
     if op in {AggregateOp.BOOL_AND, AggregateOp.BOOL_OR}:
         return bool

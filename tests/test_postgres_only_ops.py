@@ -23,6 +23,8 @@ from strawberry_django_aggregates.errors import (
 @pytest.mark.parametrize("op", [
     AggregateOp.STDDEV,
     AggregateOp.VARIANCE,
+    AggregateOp.STDDEV_POP,
+    AggregateOp.VAR_POP,
     AggregateOp.ARRAY_AGG,
     AggregateOp.STRING_AGG,
 ])

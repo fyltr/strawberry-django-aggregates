@@ -161,8 +161,10 @@ AggregateOp = StrEnum:
     AVG            = "avg"
     MIN            = "min"
     MAX            = "max"
-    STDDEV         = "stddev"          # Postgres only
-    VARIANCE       = "variance"        # Postgres only
+    STDDEV         = "stddev"          # Postgres only — sample stddev
+    VARIANCE       = "variance"        # Postgres only — sample variance
+    STDDEV_POP     = "stddev_pop"      # Postgres only — population stddev
+    VAR_POP        = "var_pop"         # Postgres only — population variance
     BOOL_AND       = "bool_and"
     BOOL_OR        = "bool_or"
     ARRAY_AGG      = "array_agg"       # Postgres only
@@ -180,6 +182,8 @@ Direct mapping to SQL — no operator outside this enum reaches the database:
 | `min` / `max` | `MIN(col)` / `MAX(col)` | All | type of `col` |
 | `stddev` | `STDDEV_SAMP(col)` | **Postgres only** | `Float` |
 | `variance` | `VAR_SAMP(col)` | **Postgres only** | `Float` |
+| `stddev_pop` | `STDDEV_POP(col)` | **Postgres only** | `Float` |
+| `var_pop` | `VAR_POP(col)` | **Postgres only** | `Float` |
 | `bool_and` | `BOOL_AND(col)` | Postgres native; SQLite emulated via `MIN(col::int)::bool` | `Boolean` |
 | `bool_or` | `BOOL_OR(col)` | Postgres native; SQLite emulated via `MAX(col::int)::bool` | `Boolean` |
 | `array_agg` | `ARRAY_AGG(col ORDER BY <pk>)` | **Postgres only** | `[ID!]` or `[String!]` etc. |
@@ -195,7 +199,7 @@ Field types map to default operator allowlists. Consumers can narrow further via
 
 | Django field type | Default operators |
 |---|---|
-| `IntegerField`, `BigIntegerField`, `FloatField`, `DecimalField`, `DurationField` | `sum, avg, min, max, stddev, variance` |
+| `IntegerField`, `BigIntegerField`, `FloatField`, `DecimalField`, `DurationField` | `sum, avg, min, max, stddev, variance, stddev_pop, var_pop` |
 | `DateField`, `DateTimeField`, `TimeField` | `min, max` |
 | `BooleanField` | `bool_and, bool_or` |
 | `CharField`, `TextField`, `EmailField`, `URLField`, `SlugField` | `min, max, array_agg, string_agg` |
@@ -443,7 +447,7 @@ Type generation produces the same SDL for the same inputs. Rules:
 
 - Iterate field allowlists in declaration order (preserves Python dict insertion order).
 - Iterate operator overrides in `sorted()` key order.
-- Emit operator nested types (`<Model>SumFields` etc.) in canonical operator order: `count, count_distinct, sum, avg, min, max, stddev, variance, bool_and, bool_or, array_agg, string_agg`.
+- Emit operator nested types (`<Model>SumFields` etc.) in canonical operator order: `count, count_distinct, sum, avg, min, max, stddev, variance, stddev_pop, var_pop, bool_and, bool_or, array_agg, string_agg`.
 - Emit HAVING input fields by `(measure, comparison)` in canonical comparison order: `Gt, Lt, Lte, Gte, Eq, Neq, In, NotIn`.
 - No timestamps, no PRNG, no `datetime.now()`, no `uuid4()`, no insertion-order-sensitive iteration.
 

@@ -16,8 +16,9 @@ class AggregateOp(StrEnum):
 
     Database support flags are documented in ``docs/SPEC.md``. The
     Postgres-only operators (``ARRAY_AGG``, ``STRING_AGG``, ``STDDEV``,
-    ``VARIANCE``) raise :class:`OperatorNotSupportedError` at resolver
-    entry on SQLite connections.
+    ``VARIANCE``, ``STDDEV_POP``, ``VAR_POP``) raise
+    :class:`OperatorNotSupportedError` at resolver entry on SQLite
+    connections.
     """
 
     COUNT          = "count"
@@ -26,8 +27,10 @@ class AggregateOp(StrEnum):
     AVG            = "avg"
     MIN            = "min"
     MAX            = "max"
-    STDDEV         = "stddev"          # Postgres only
-    VARIANCE       = "variance"        # Postgres only
+    STDDEV         = "stddev"          # Postgres only — sample stddev
+    VARIANCE       = "variance"        # Postgres only — sample variance
+    STDDEV_POP     = "stddev_pop"      # Postgres only — population stddev
+    VAR_POP        = "var_pop"         # Postgres only — population variance
     BOOL_AND       = "bool_and"
     BOOL_OR        = "bool_or"
     ARRAY_AGG      = "array_agg"       # Postgres only
@@ -43,6 +46,8 @@ _NUMERIC_OPS = (
     AggregateOp.MAX,
     AggregateOp.STDDEV,
     AggregateOp.VARIANCE,
+    AggregateOp.STDDEV_POP,
+    AggregateOp.VAR_POP,
 )
 
 _DATE_OPS = (

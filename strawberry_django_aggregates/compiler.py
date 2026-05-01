@@ -72,6 +72,8 @@ if TYPE_CHECKING:
 _POSTGRES_ONLY_OPS: frozenset[AggregateOp] = frozenset({
     AggregateOp.STDDEV,
     AggregateOp.VARIANCE,
+    AggregateOp.STDDEV_POP,
+    AggregateOp.VAR_POP,
     AggregateOp.ARRAY_AGG,
     AggregateOp.STRING_AGG,
 })
@@ -448,6 +450,10 @@ def _build_aggregate_expression(
         return StdDev(field_path, sample=True)  # type: ignore[arg-type]
     if op is AggregateOp.VARIANCE:
         return Variance(field_path, sample=True)  # type: ignore[arg-type]
+    if op is AggregateOp.STDDEV_POP:
+        return StdDev(field_path, sample=False)  # type: ignore[arg-type]
+    if op is AggregateOp.VAR_POP:
+        return Variance(field_path, sample=False)  # type: ignore[arg-type]
     if op is AggregateOp.BOOL_AND:
         return _bool_and(field_path, vendor)
     if op is AggregateOp.BOOL_OR:
