@@ -16,7 +16,8 @@ modules only — never from ``strawberry`` or ``strawberry_django``.
 from __future__ import annotations
 
 import datetime
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any, overload
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -350,6 +351,60 @@ class _Tuple(Func):
 # Public API
 # ---------------------------------------------------------------------------
 
+# ``@overload`` declarations narrow the return type at call sites:
+# omitting ``chunk_size`` (or passing ``None``) returns ``list[dict]`` —
+# the legacy shape every pre-Stream-13 caller expects. Passing a
+# positive ``int`` returns ``Iterator[list[dict]]``. The runtime
+# implementation accepts both shapes through a union return type;
+# the overloads are pure type-checker information.
+
+
+@overload
+def compute_aggregation(
+    queryset: QuerySet,
+    *,
+    group_by:   list[tuple[str, Granularity | None]] | None = ...,
+    aggregates: list[tuple[AggregateOp, str | None]]   | None = ...,
+    having:     dict[str, Any]                          | None = ...,
+    order_by:   list[tuple[str, str, str | None]]      | None = ...,
+    offset:     int = ...,
+    limit:      int | None = ...,
+    tz:         str | None = ...,
+    week_start: int = ...,
+    respect_comodel_ordering: bool = ...,
+    op_args:    dict[str, dict[str, Any]] | None = ...,
+    fill:       bool = ...,
+    fill_min:   datetime.datetime | None = ...,
+    fill_max:   datetime.datetime | None = ...,
+    allow_relation_traversal: bool = ...,
+    json_paths: dict[str, str] | None = ...,
+    chunk_size: None = ...,
+) -> list[dict[str, Any]]: ...
+
+
+@overload
+def compute_aggregation(
+    queryset: QuerySet,
+    *,
+    group_by:   list[tuple[str, Granularity | None]] | None = ...,
+    aggregates: list[tuple[AggregateOp, str | None]]   | None = ...,
+    having:     dict[str, Any]                          | None = ...,
+    order_by:   list[tuple[str, str, str | None]]      | None = ...,
+    offset:     int = ...,
+    limit:      int | None = ...,
+    tz:         str | None = ...,
+    week_start: int = ...,
+    respect_comodel_ordering: bool = ...,
+    op_args:    dict[str, dict[str, Any]] | None = ...,
+    fill:       bool = ...,
+    fill_min:   datetime.datetime | None = ...,
+    fill_max:   datetime.datetime | None = ...,
+    allow_relation_traversal: bool = ...,
+    json_paths: dict[str, str] | None = ...,
+    chunk_size: int = ...,
+) -> Iterator[list[dict[str, Any]]]: ...
+
+
 def compute_aggregation(
     queryset: QuerySet,
     *,
@@ -368,7 +423,8 @@ def compute_aggregation(
     fill_max:   datetime.datetime | None = None,
     allow_relation_traversal: bool = False,
     json_paths: dict[str, str] | None = None,
-) -> list[dict[str, Any]]:
+    chunk_size: int | None = None,
+) -> list[dict[str, Any]] | Iterator[list[dict[str, Any]]]:
     """Compile a queryset into an aggregation query.
 
     See ``docs/SPEC.md`` § 10 for the full contract. Permission-naive —
@@ -438,6 +494,42 @@ def compute_aggregation(
     filling. Ordering: filled rows are sorted ascending by the bucket
     alias by default; an explicit ``order_by`` re-applies on the
     filled list.
+
+    ``chunk_size`` (SPEC § 19) toggles streaming mode. When set to a
+    positive integer, the function returns an
+    ``Iterator[list[dict[str, Any]]]`` that yields successive batches
+    of result rows sized at most ``chunk_size``. SQL-side keyset
+    pagination on the canonical-order group-by tuple drives the
+    streaming, so memory use stays bounded regardless of total
+    cardinality. Designed for backend bulk processing — DRF views,
+    Celery tasks, MCP tools, ``manage.py shell`` — where the consumer
+    wants to process a large grouped result without materializing it
+    all at once. Restrictions:
+
+    - ``chunk_size`` REQUIRES ``group_by`` to be non-empty. The keyset
+      cursor needs the group-by tuple to advance; a single-row
+      aggregate would yield exactly one chunk of one row, but the
+      streaming machinery is overkill for that case.
+    - ``chunk_size`` overrides any user-supplied ``order_by`` — the
+      keyset cursor needs strict ascending order on the group-by
+      tuple to be correct. Callers needing custom ordering must
+      materialize the iterator and sort post-hoc.
+    - ``chunk_size`` is INCOMPATIBLE with ``offset`` / ``limit``.
+      Both raise :class:`AggregateError` when combined; users should
+      either stream the full result and slice the iterator, or use
+      ``offset`` / ``limit`` without streaming.
+    - ``chunk_size`` is INCOMPATIBLE with ``fill=True``. Filling needs
+      the full result set in memory to compute the dense spine, so
+      the two modes cannot compose. Raises
+      :class:`AggregateError`.
+    - GraphQL surface: ``chunk_size`` is a backend-primitive feature
+      only. ``AggregateBuilder`` does NOT expose it as a wire arg —
+      client-facing pagination uses cursor pagination (Stream 11).
+      See SPEC § 19 for rationale.
+
+    When ``chunk_size`` is unset (the default), the return type is
+    ``list[dict[str, Any]]`` as before this stream — backwards-
+    compatible with all pre-Stream-13 callers.
     """
     group_by    = group_by    or []
     aggregates  = aggregates  or []
@@ -466,6 +558,11 @@ def compute_aggregation(
         raise AggregateError(
             "fill_min / fill_max require fill=True. Pass fill=True to "
             "enable empty-bucket filling, or remove the bounds.",
+        )
+
+    if chunk_size is not None:
+        _validate_chunk_size(
+            chunk_size, group_by, offset, limit, fill,
         )
 
     if allow_relation_traversal:
@@ -507,6 +604,18 @@ def compute_aggregation(
 
     if having_q is not None:
         qs = qs.filter(having_q)
+
+    if chunk_size is not None:
+        # Streaming path: keyset-pagination over the canonical group-by
+        # tuple. Fill / offset / limit are rejected upstream by
+        # ``_validate_chunk_size``; user-supplied ``order_by`` is
+        # ignored (the keyset cursor needs strict ascending order on
+        # the group-by tuple). Returns an iterator of chunks.
+        return _iter_chunks(
+            qs=qs,
+            group_aliases=group_aliases,
+            chunk_size=chunk_size,
+        )
 
     # Apply user-supplied ordering before fill so the pre-fill rows are
     # in the order the user asked for. Filling re-sorts ascending by
@@ -598,6 +707,159 @@ def _validate_fill_spec(
             f"{type(granularity).__name__ if granularity else 'None'} "
             f"on field `{field_path}`.",
         )
+
+
+# ---------------------------------------------------------------------------
+# Streaming / chunked iteration — Stream 13 / SPEC § 19.
+# ---------------------------------------------------------------------------
+#
+# When ``compute_aggregation`` is called with ``chunk_size``, the return
+# type widens from ``list[dict]`` to ``Iterator[list[dict]]``. The iterator
+# yields successive chunks of result rows sized at most ``chunk_size``,
+# advanced via SQL-side keyset pagination on the canonical group-by
+# tuple. Memory use stays bounded by ``chunk_size`` regardless of total
+# group cardinality — designed for backend bulk processing (Celery
+# tasks, DRF views, ``manage.py shell``, MCP tools).
+
+
+def _validate_chunk_size(
+    chunk_size: int,
+    group_by: list[tuple[str, Granularity | None]],
+    offset: int,
+    limit: int | None,
+    fill: bool,
+) -> None:
+    """Validate ``chunk_size`` and its co-arg incompatibilities.
+
+    Raises :class:`AggregateError` when:
+
+    - ``chunk_size`` is not a positive integer (``bool`` is rejected
+      because ``True`` / ``False`` would silently coerce to 1 / 0
+      under ``isinstance(_, int)`` — fail loud instead).
+    - ``group_by`` is empty (the keyset cursor needs the group-by
+      tuple to advance).
+    - ``offset`` is non-zero or ``limit`` is set (incompatible with
+      streaming — the consumer slices the iterator instead).
+    - ``fill=True`` (filling needs the full result set in memory to
+      compute the dense spine; the two modes cannot compose).
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+        raise AggregateError(
+            f"`chunk_size` must be a positive int; got "
+            f"{type(chunk_size).__name__} {chunk_size!r}.",
+        )
+    if chunk_size <= 0:
+        raise AggregateError(
+            f"`chunk_size` must be a positive int; got {chunk_size!r}. "
+            f"Pass a positive value or omit the argument to disable "
+            f"streaming.",
+        )
+    if not group_by:
+        raise AggregateError(
+            "`chunk_size` requires a non-empty `group_by` — the "
+            "streaming keyset cursor needs a group-by tuple to "
+            "advance. For un-grouped aggregates the result is a "
+            "single row; remove `chunk_size`.",
+        )
+    if offset or limit is not None:
+        raise AggregateError(
+            "`chunk_size` is incompatible with `offset` / `limit`. "
+            "Either stream the full result and slice the iterator in "
+            "Python, or use `offset` / `limit` without streaming.",
+        )
+    if fill:
+        raise AggregateError(
+            "`chunk_size` is incompatible with `fill=True`. Empty-"
+            "bucket filling needs the full post-HAVING result set in "
+            "memory to compute the dense spine. Either stream without "
+            "fill, or fill without streaming.",
+        )
+
+
+def _iter_chunks(
+    *,
+    qs: QuerySet,
+    group_aliases: list[str],
+    chunk_size: int,
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield chunks of ``chunk_size`` rows, keyset-paginated.
+
+    Strategy: ORDER BY the canonical group-by tuple ascending,
+    LIMIT ``chunk_size`` per round-trip. The trailing row of each
+    chunk supplies the keyset cursor — the next round-trip filters
+    ``(a, b, c) > (cursor_a, cursor_b, cursor_c)`` and reads the
+    next ``chunk_size``. Stops when a round-trip yields fewer than
+    ``chunk_size`` rows (the final chunk).
+
+    The caller's ``qs`` MUST already carry the group-by + aggregate
+    annotations and any HAVING filter — this helper only adds the
+    ORDER BY, the keyset filter, and the slice. ``qs`` MUST NOT
+    carry an existing slice (``[a:b]``) or ORDER BY — those would
+    collide with the streaming machinery; the validation upstream
+    prevents the slice case (``offset`` / ``limit`` raise) and the
+    streaming branch in :func:`compute_aggregation` skips applying
+    ``order_by`` so an existing ORDER BY is impossible too.
+
+    Memory: the working set per yield is ``chunk_size`` rows;
+    cursor state is the trailing group-by tuple as a list of
+    primitives (encoded values internal to this generator only —
+    never exits the function).
+    """
+    cursor_vals: list[Any] | None = None
+    while True:
+        page_qs = qs.order_by(*group_aliases)
+        if cursor_vals is not None:
+            keyset_q = _build_keyset_filter(group_aliases, cursor_vals)
+            if keyset_q is not None:
+                page_qs = page_qs.filter(keyset_q)
+        page_qs = page_qs[:chunk_size]
+        rows = list(page_qs)
+        if not rows:
+            return
+        yield rows
+        if len(rows) < chunk_size:
+            # Short page → end of result set. Stop without an extra
+            # round-trip.
+            return
+        # Harvest the keyset cursor from the trailing row.
+        last = rows[-1]
+        cursor_vals = [last.get(alias) for alias in group_aliases]
+
+
+def _build_keyset_filter(
+    aliases: list[str], values: list[Any],
+) -> Q | None:
+    """Build a strict-greater-than keyset ``Q`` over ``aliases`` /
+    ``values``.
+
+    Equivalent to ``(a, b, c) > (av, bv, cv)`` unrolled to a
+    disjunction of conjunctions::
+
+        Q(a__gt=av)
+        | (Q(a=av) & Q(b__gt=bv))
+        | (Q(a=av) & Q(b=bv) & Q(c__gt=cv))
+
+    Mirrors the row-constructor semantics that PostgreSQL supports
+    natively but Django's ORM doesn't expose. Returns ``None`` when
+    ``aliases`` is empty (defensive — the call site already
+    guarantees non-empty group_by). NULL handling: SQL ``>`` against
+    NULL is unknown, so rows where any group alias is NULL are
+    omitted from the next page. Strict but predictable; matches the
+    semantics of the cursor-pagination keyset in
+    :mod:`strawberry_django_aggregates.builder`.
+    """
+    if not aliases or len(aliases) != len(values):
+        return None
+    clauses: list[Q] = []
+    for i, alias in enumerate(aliases):
+        prefix = Q()
+        for j in range(i):
+            prefix &= Q(**{aliases[j]: values[j]})
+        clauses.append(prefix & Q(**{f"{alias}__gt": values[i]}))
+    combined: Q | None = None
+    for c in clauses:
+        combined = c if combined is None else combined | c
+    return combined
 
 
 def _resolve_fill_bounds(

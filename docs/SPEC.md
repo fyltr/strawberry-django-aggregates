@@ -1036,6 +1036,15 @@ Returns a flat list of dicts. Group-by keys live alongside aggregate aliases on 
 
 `compute_aggregation` is permission-naive — the queryset must already be scoped by the caller. This is the same separation of concerns the rest of the Django ecosystem uses (managers/querysets do the scoping, query libraries compose).
 
+### Streaming mode (`chunk_size`)
+
+Passing `chunk_size: int | None = None` (default `None`) toggles a streaming return shape:
+
+- `chunk_size=None` (default) — `compute_aggregation` returns `list[dict[str, Any]]` exactly as before. Backwards-compatible with every pre-Stream-13 caller.
+- `chunk_size=N` (positive int) — `compute_aggregation` returns `Iterator[list[dict[str, Any]]]`. The iterator yields successive chunks sized at most `N`; the final chunk may be shorter. SQL-side keyset pagination on the canonical group-by tuple drives the streaming, so memory stays bounded by `chunk_size` regardless of total cardinality. Designed for backend bulk processing (Celery tasks, DRF views, MCP tools, `manage.py shell`). See § 19.
+
+The return type is a union: `list[dict[str, Any]] | Iterator[list[dict[str, Any]]]`. Callers that pass `chunk_size` should treat the result as an iterator; callers that don't get a list as before.
+
 ### Errors
 
 | Error | Trigger |
@@ -1160,7 +1169,7 @@ tests/
 - **Aggregate-of-relation as a parent field** (e.g. `order.itemsAggregate`). Would need a `Subquery` emission strategy. Documented alternative (top-level child query) covers most cases. Possible v2.
 - **Apollo Federation v2 first-class wiring.** v1.0 ships an opt-in `enable_federation` flag on `AggregateBuilder` that emits `@external` on `<Model>GroupKey` FK fields and decorates emitted types with `strawberry.federation.type`. Full `@key` / `@requires` / `@provides` semantics are deferred — see § 18.
 - **Window functions** (`ROW_NUMBER`, `RANK`, `LAG`, etc.). Adjacent feature space; would need a new `<Model>Windowed` shape. Out of scope.
-- **Streaming / chunked group-by** for cardinality > 100k group buckets. Memory pressure is real; v2 might add a `chunk_size` parameter to `compute_aggregation` and a streaming resolver.
+- **Streaming / chunked group-by** for cardinality > 100k group buckets. v1.0 ships a backend-primitive `chunk_size` parameter on `compute_aggregation` (§ 19). The GraphQL surface deliberately stays on offset / cursor pagination — chunked streaming is a backend bulk-processing tool, not a wire-side pagination story.
 
 ## 16 · Versioning
 
@@ -1218,6 +1227,69 @@ A `@key` directive identifies an entity that subgraphs can reference by an opaqu
 ### Determinism
 
 The `enable_federation` branch is fully deterministic — same inputs produce byte-identical SDL across two generations. The federation `field(external=True)` re-binding happens during `_emit_group_key` before the `strawberry.federation.type` decorator runs, so the emitted type signature is stable.
+
+## 19 · Streaming / chunked group-by
+
+Backend bulk processing — Celery tasks, DRF views, MCP tools, plain `manage.py shell` — sometimes needs to walk a large grouped result set without holding all rows in memory. v1.0 ships an opt-in streaming mode on the backend primitive `compute_aggregation`. The GraphQL surface is intentionally NOT touched: client-facing pagination is offset (default) or cursor (Stream 11) — chunked streaming is a primitive-level concern.
+
+### API
+
+```python
+from strawberry_django_aggregates import compute_aggregation, AggregateOp
+
+# Non-streaming (default): returns list[dict].
+rows = compute_aggregation(qs, group_by=[("customer", None)],
+                            aggregates=[(AggregateOp.COUNT, None)])
+
+# Streaming: returns Iterator[list[dict]].
+for chunk in compute_aggregation(
+    qs,
+    group_by=[("customer", None)],
+    aggregates=[(AggregateOp.COUNT, None)],
+    chunk_size=1000,
+):
+    process(chunk)              # each chunk is a list[dict] of <= 1000 rows
+```
+
+Return type widens to `list[dict[str, Any]] | Iterator[list[dict[str, Any]]]`. Callers that pass `chunk_size` get the iterator; callers that omit it get the legacy list shape (backwards-compatible with every pre-Stream-13 caller).
+
+### How it works
+
+SQL-side keyset pagination on the canonical group-by tuple. The compiler:
+
+1. Builds the annotated queryset (group_by + aggregates + HAVING) exactly as the non-streaming path.
+2. ORDER BY canonical group-by tuple ascending, LIMIT `chunk_size`.
+3. Yields the chunk as a `list[dict]`.
+4. Records the trailing row's group-by tuple as the next-page cursor.
+5. Filters `(a, b, c) > (cursor_a, cursor_b, cursor_c)` and re-LIMITs `chunk_size` for the next round-trip.
+6. Stops when a round-trip yields fewer than `chunk_size` rows (final chunk is short, or the result set is exhausted).
+
+Keyset filter shape (mirrors the cursor-pagination keyset from § 4):
+
+```sql
+WHERE (a > $a)
+   OR (a = $a AND b > $b)
+   OR (a = $a AND b = $b AND c > $c)
+```
+
+Memory: the working set per yield is `chunk_size` rows; cursor state is the trailing group-by tuple (one list of primitives). Total memory is O(chunk_size), independent of result-set cardinality. The cursor codec from `pagination.py` (Stream 11) is conceptually shared — same canonical-order group-by tuple — but the streaming generator operates on raw Python values internally; it never encodes / decodes a base64 cursor string because no cursor leaves the function.
+
+### Restrictions
+
+- **Requires non-empty `group_by`**. The keyset cursor needs a tuple to advance. Single-row aggregates (no group_by) yield exactly one row anyway — streaming is moot.
+- **Overrides user `order_by`**. The keyset cursor needs strict ascending order on the group-by tuple to be correct. Any caller-supplied `order_by` is silently ignored when `chunk_size` is set; callers needing custom ordering must materialize the iterator and sort post-hoc. Documented in the docstring.
+- **Incompatible with `offset` / `limit`**. Both raise `AggregateError` when combined with `chunk_size`. Either stream the full result and slice the iterator in Python, or use `offset` / `limit` without streaming.
+- **Incompatible with `fill=True`**. Empty-bucket filling needs the full post-HAVING result set in memory to compute the dense spine. Raises `AggregateError`.
+- **HAVING is supported**. HAVING applies SQL-side per chunk; the keyset cursor on the group-by tuple still advances correctly because HAVING is a post-aggregation filter that doesn't perturb the row order.
+- **Empty validation cases fail loud**: `chunk_size <= 0`, non-int values, and `bool` (which would silently coerce to 1 / 0) all raise `AggregateError`.
+
+### Why not on the GraphQL surface
+
+Streaming is a backend bulk-processing tool. GraphQL clients ask "give me the next page" via offset or cursor pagination — they don't pull a Python iterator. Surfacing `chunk_size` as a wire arg would conflate two semantically different concerns (memory-bounded backend iteration vs. user-facing page navigation) and break Critical Rule 9 (the resolver shouldn't expose primitive-level escape hatches generically). The wiring layer is free to wrap a `compute_aggregation(chunk_size=...)` call inside an internal endpoint (e.g. an admin export view) but should never plumb the kwarg through to wire-side resolver args.
+
+### Determinism
+
+The streaming generator is deterministic given a stable queryset: same inputs ⇒ same chunks in the same order, byte-equivalent to a non-streaming call materialized into a list. Pinned by `tests/test_streaming.py` (1000-bucket / chunk-size-100 → exactly 10 chunks of 100). The keyset filter is built without `random` / `time` calls; the canonical group-by tuple ordering is the same one used elsewhere in the compiler and is byte-stable across runs.
 
 ---
 
