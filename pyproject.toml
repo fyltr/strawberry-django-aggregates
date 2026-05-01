@@ -71,8 +71,8 @@ target-version = "py313"
 select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
-DJANGO_SETTINGS_MODULE = "settings"
-python_files           = ["test_*.py"]
-testpaths              = ["tests"]
-addopts                = "-ra --strict-markers"
-pythonpath             = ["tests"]
+# Django is configured programmatically in tests/conftest.py.
+python_files = ["test_*.py"]
+testpaths    = ["tests"]
+addopts      = "-ra --strict-markers"
+pythonpath   = ["."]

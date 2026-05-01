@@ -1,4 +1,4 @@
-"""strawberry-django-aggregates — Hasura-shape aggregations for strawberry-django.
+"""strawberry-django-aggregates — Hasura aggregations for Django.
 
 Public surface:
 
