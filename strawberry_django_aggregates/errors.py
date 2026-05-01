@@ -32,10 +32,20 @@ class OrderFieldNotAllowed(AggregateError):
 class AggregationAcrossRelationError(AggregateError):
     """Raised when an aggregate measure references a one-to-many / m2m path.
 
-    Auto-traversal would cause silent row multiplication corrupting every
-    measure in the same query. Callers should query the child model with
-    the parent FK in ``group_by`` instead. ``array_agg`` is the explicit
-    escape hatch for "give me child IDs per parent group."
+    By default, auto-traversal is refused: it would cause silent row
+    multiplication corrupting every measure in the same query. The
+    canonical alternative is to query the child model with the parent FK
+    in ``group_by``. ``array_agg`` is the explicit escape hatch for
+    "give me child IDs per parent group."
+
+    For callers that genuinely need a measure across a one-to-many or
+    many-to-many relation, the backend primitive
+    :func:`strawberry_django_aggregates.compute_aggregation` accepts
+    ``allow_relation_traversal=True``. When set, the compiler emits a
+    correlated ``Subquery`` per measure (one ``Subquery`` per measure,
+    not a JOIN), which avoids row-multiplication. This flag lives only
+    on the primitive — it is intentionally not surfaced through
+    ``AggregateBuilder`` / GraphQL (Critical Rule 9 separation).
     """
 
 

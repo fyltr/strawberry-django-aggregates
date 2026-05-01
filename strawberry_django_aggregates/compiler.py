@@ -36,8 +36,10 @@ from django.db.models import (
     IntegerField,
     Max,
     Min,
+    OuterRef,
     Q,
     StdDev,
+    Subquery,
     Sum,
     TimeField,
     Value,
@@ -361,6 +363,7 @@ def compute_aggregation(
     fill:       bool = False,
     fill_min:   datetime.datetime | None = None,
     fill_max:   datetime.datetime | None = None,
+    allow_relation_traversal: bool = False,
 ) -> list[dict[str, Any]]:
     """Compile a queryset into an aggregation query.
 
@@ -387,6 +390,38 @@ def compute_aggregation(
     subclass. Aliases that don't appear here fall back to operator
     defaults (currently only the percentile ops require a fraction —
     ``MODE`` and the rest take no extra args).
+
+    ``allow_relation_traversal`` is the opt-in escape hatch for measures
+    that traverse a one-to-many or many-to-many relation (e.g.
+    ``SUM("items__price")`` on an ``Order`` queryset). Default is
+    ``False`` — the compiler refuses with
+    :class:`~strawberry_django_aggregates.errors.AggregationAcrossRelationError`,
+    preserving the no-row-multiplication contract (CLAUDE.md Critical
+    Rule 4). When set to ``True``, the compiler emits a correlated
+    ``Subquery`` per traversing measure
+    (``Subquery(Child.objects.filter(parent_fk=OuterRef('pk'))
+    .values('parent_fk').annotate(_=AGG('field')).values('_'))``) which
+    dodges silent row-multiplication: each measure is computed in its
+    own scalar subquery, so additional measures on the outer queryset
+    are unaffected by the child fan-out.
+
+    Restrictions when ``allow_relation_traversal=True``:
+
+    - Only ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` / ``COUNT`` /
+      ``COUNT_DISTINCT`` are supported with relation-traversing field
+      paths in v1.0. The other operators
+      (``STDDEV`` / ``VARIANCE`` / ``STDDEV_POP`` / ``VAR_POP`` /
+      ``PERCENTILE_*`` / ``MODE`` / ``ARRAY_AGG`` / ``STRING_AGG`` /
+      ``BOOL_AND`` / ``BOOL_OR`` / ``COUNT_DISTINCT_TUPLE``) raise an
+      :class:`~strawberry_django_aggregates.errors.AggregateError` with
+      a clear v1.0 limitation message.
+    - The flag applies to MEASURES only. ``group_by`` paths still
+      cannot traverse one-to-many or many-to-many relations even with
+      the flag — that would row-multiply the outer query and corrupt
+      every measure regardless of subquery isolation.
+    - This flag lives on the backend primitive only. ``AggregateBuilder``
+      / GraphQL surface does NOT expose it (CLAUDE.md Critical Rule 9 +
+      Rule 4 separation).
 
     ``fill`` enables empty-bucket filling (SPEC § 7.2). When ``True``,
     ``group_by`` MUST contain exactly one ``TimeGranularity`` entry —
@@ -429,6 +464,8 @@ def compute_aggregation(
             "enable empty-bucket filling, or remove the bounds.",
         )
 
+    if allow_relation_traversal:
+        _validate_relation_traversal_ops(aggregates)
     _validate_postgres_only(aggregates, vendor)
 
     group_annotations, group_aliases = _build_group_by_annotations(
@@ -437,6 +474,7 @@ def compute_aggregation(
 
     aggregate_annotations = _build_aggregate_annotations(
         model, aggregates, vendor, op_args,
+        allow_relation_traversal=allow_relation_traversal,
     )
 
     having_q = _build_having_q(having, aggregate_annotations.keys())
@@ -685,6 +723,38 @@ def _resolve_tzinfo(tz_name: str) -> ZoneInfo:
     return ZoneInfo(tz_name)
 
 
+def _validate_relation_traversal_ops(
+    aggregates: list[tuple[AggregateOp, str | None]],
+) -> None:
+    """Reject relation-traversing measures whose operator is not
+    supported with ``allow_relation_traversal=True`` in v1.0.
+
+    Runs BEFORE the PG-only vendor check so the v1.0-limitation
+    message wins over a generic "PG-only" message on non-PG vendors.
+    Operators whose path is non-traversing skip this check.
+    """
+    for op, field_path in aggregates:
+        if field_path is None or "__" not in field_path:
+            continue
+        if op is AggregateOp.COUNT_DISTINCT_TUPLE:
+            # COUNT_DISTINCT_TUPLE encodes a multi-segment "fields
+            # tuple" syntactically as ``a__b__c`` but does not
+            # traverse a relation — segments are sibling fields on
+            # the same model. Validated elsewhere.
+            continue
+        if op not in _RELATION_TRAVERSAL_OPS:
+            raise AggregateError(
+                f"Operator {op.value!r} is not supported with "
+                f"`allow_relation_traversal=True` in v1.0. "
+                f"Supported operators for relation-traversing "
+                f"measures: "
+                f"{sorted(o.value for o in _RELATION_TRAVERSAL_OPS)}. "
+                f"Either use one of those operators or query the "
+                f"child model directly with the parent FK in "
+                f"`group_by`."
+            )
+
+
 def _validate_postgres_only(
     aggregates: list[tuple[AggregateOp, str | None]],
     vendor: str,
@@ -705,17 +775,61 @@ def _validate_postgres_only(
 
 
 def _resolve_field(
-    model: Any, field_path: str, error_cls: type[Exception],
+    model: Any,
+    field_path: str,
+    error_cls: type[Exception],
+    *,
+    allow_relation: bool = False,
 ) -> Field:
-    """Resolve a *single-segment* field name. Raises if it traverses a
-    relation (``__`` in path) or is not an attribute of the model.
+    """Resolve a field name, optionally walking a relation path.
+
+    Default (``allow_relation=False``): refuses any ``__``-traversing
+    path with :class:`AggregationAcrossRelationError`. Single-segment
+    names resolve via ``model._meta.get_field``.
+
+    With ``allow_relation=True``: walks each segment, validating that
+    the prior segment exposes a relation (FK forward, FK reverse o2m,
+    or m2m) and resolves to the leaf field. Used by the relation-
+    traversal-opt-in measure path; the leaf field is what the operator
+    is applied to, while the relation chain itself is rebuilt by
+    :func:`_resolve_traversal_chain` for ``Subquery`` emission.
     """
     if "__" in field_path:
-        raise AggregationAcrossRelationError(
-            f"Cannot aggregate across relation `{field_path}` from "
-            f"`{model.__name__}` — would cause silent row multiplication. "
-            f"Query the related model directly with the parent FK in "
-            f"`group_by` instead."
+        if not allow_relation:
+            raise AggregationAcrossRelationError(
+                f"Cannot aggregate across relation `{field_path}` from "
+                f"`{model.__name__}` — would cause silent row "
+                f"multiplication. Query the related model directly "
+                f"with the parent FK in `group_by` instead, or pass "
+                f"`allow_relation_traversal=True` to "
+                f"`compute_aggregation` to opt into Subquery-emitted "
+                f"measures."
+            )
+        segments = field_path.split("__")
+        current_model: Any = model
+        for i, segment in enumerate(segments):
+            try:
+                f = current_model._meta.get_field(segment)
+            except Exception as exc:
+                raise error_cls(
+                    f"Field `{segment}` (in path `{field_path}`) not "
+                    f"found on `{current_model.__name__}`."
+                ) from exc
+            is_last = i == len(segments) - 1
+            if is_last:
+                return f
+            related = getattr(f, "related_model", None)
+            if related is None:
+                raise error_cls(
+                    f"Segment `{segment}` in path `{field_path}` on "
+                    f"`{current_model.__name__}` is not a relation; "
+                    f"cannot traverse further."
+                )
+            current_model = related
+        # Defensive — segments is non-empty by virtue of "__" in path.
+        raise error_cls(
+            f"Could not resolve relation path `{field_path}` from "
+            f"`{model.__name__}`."
         )
     try:
         return model._meta.get_field(field_path)
@@ -728,6 +842,63 @@ def _resolve_field(
 def _is_relation_to_many(field: Field) -> bool:
     return bool(getattr(field, "one_to_many", False)
                 or getattr(field, "many_to_many", False))
+
+
+def _resolve_traversal_chain(
+    model: Any, field_path: str,
+) -> tuple[list[Any], Any, str]:
+    """Walk a ``__``-traversing path and return the relation chain.
+
+    Returns ``(chain_fields, leaf_model, leaf_field_name)`` where
+    ``chain_fields`` is the list of relation fields traversed in order
+    (one entry per ``__``-separated segment except the leaf), and
+    ``leaf_model`` is the model carrying the leaf scalar field.
+
+    The traversal validates each non-leaf segment is a relation; the
+    leaf segment must be a scalar (non-relation). All errors here are
+    raised as :class:`AggregationAcrossRelationError` because the
+    caller has already opted in to traversal — the only failures left
+    are malformed paths.
+    """
+    segments = field_path.split("__")
+    if len(segments) < 2:
+        raise AggregationAcrossRelationError(
+            f"Path `{field_path}` does not traverse a relation."
+        )
+    chain: list[Any] = []
+    current_model: Any = model
+    for segment in segments[:-1]:
+        try:
+            f = current_model._meta.get_field(segment)
+        except Exception as exc:
+            raise AggregationAcrossRelationError(
+                f"Segment `{segment}` in path `{field_path}` not "
+                f"found on `{current_model.__name__}`."
+            ) from exc
+        related = getattr(f, "related_model", None)
+        if related is None:
+            raise AggregationAcrossRelationError(
+                f"Segment `{segment}` in path `{field_path}` on "
+                f"`{current_model.__name__}` is not a relation; "
+                f"cannot traverse further."
+            )
+        chain.append(f)
+        current_model = related
+    leaf_name = segments[-1]
+    try:
+        leaf_field = current_model._meta.get_field(leaf_name)
+    except Exception as exc:
+        raise AggregationAcrossRelationError(
+            f"Leaf field `{leaf_name}` (in path `{field_path}`) not "
+            f"found on `{current_model.__name__}`."
+        ) from exc
+    if getattr(leaf_field, "is_relation", False):
+        raise AggregationAcrossRelationError(
+            f"Leaf segment `{leaf_name}` in path `{field_path}` is a "
+            f"relation, not a scalar field — cannot aggregate over a "
+            f"relation directly."
+        )
+    return chain, current_model, leaf_name
 
 
 # ---------------------------------------------------------------------------
@@ -915,27 +1086,82 @@ def _extract_day_of_week_rotated(
 # aggregate annotations
 # ---------------------------------------------------------------------------
 
+# Operators that are supported with ``allow_relation_traversal=True``
+# in v1.0. Subquery emission uses these straightforwardly; the rest are
+# either ordered-set aggregates, vendor-specific composites, or already-
+# tuple operators that don't compose cleanly with a one-measure-per-
+# subquery shape — so we refuse them at resolver entry rather than
+# emitting incorrect SQL.
+_RELATION_TRAVERSAL_OPS: frozenset[AggregateOp] = frozenset({
+    AggregateOp.COUNT,
+    AggregateOp.COUNT_DISTINCT,
+    AggregateOp.SUM,
+    AggregateOp.AVG,
+    AggregateOp.MIN,
+    AggregateOp.MAX,
+})
+
+
 def _build_aggregate_annotations(
     model: type,
     aggregates: list[tuple[AggregateOp, str | None]],
     vendor: str,
     op_args: dict[str, dict[str, Any]],
+    *,
+    allow_relation_traversal: bool = False,
 ) -> dict[str, Aggregate]:
     annotations: dict[str, Aggregate] = {}
     for op, field_path in aggregates:
         field: Field | None
+        traverses_relation = (
+            field_path is not None
+            and "__" in field_path
+            and op is not AggregateOp.COUNT_DISTINCT_TUPLE
+        )
         if op is AggregateOp.COUNT_DISTINCT_TUPLE:
             # Multi-segment path encoded as ``a__b__c`` — validate each
             # segment as a single-field name on the model. The
             # COUNT_DISTINCT_TUPLE branch in
             # :func:`_build_aggregate_expression` operates on the raw
-            # segment list, not on a single Field.
+            # segment list, not on a single Field. Tuple semantics
+            # don't compose with the single-measure subquery emission,
+            # so the relation-traversal flag does not extend here.
             assert field_path is not None
             for segment in field_path.split("__"):
                 _resolve_field(model, segment, GroupByFieldNotAllowed)
             field = None
+        elif traverses_relation:
+            assert field_path is not None
+            # ``_resolve_field`` raises ``AggregationAcrossRelationError``
+            # when ``allow_relation`` is ``False`` (the default refusal
+            # path); when ``True`` it walks the chain and returns the
+            # leaf field. Either branch produces a typed error or a
+            # validated leaf field — no separate fail-loud needed here.
+            field = _resolve_field(
+                model, field_path, GroupByFieldNotAllowed,
+                allow_relation=allow_relation_traversal,
+            )
+            # Operator-supported check runs AFTER path validation so
+            # invalid paths still surface their (more useful) typed
+            # error; ``_validate_relation_traversal_ops`` at the top of
+            # ``compute_aggregation`` covers the same set, but is
+            # repeated here so callers building annotations directly
+            # cannot bypass the check.
+            if op not in _RELATION_TRAVERSAL_OPS:
+                raise AggregateError(
+                    f"Operator {op.value!r} is not supported with "
+                    f"`allow_relation_traversal=True` in v1.0. "
+                    f"Supported operators for relation-traversing "
+                    f"measures: "
+                    f"{sorted(o.value for o in _RELATION_TRAVERSAL_OPS)}. "
+                    f"Either use one of those operators or query the "
+                    f"child model directly with the parent FK in "
+                    f"`group_by`."
+                )
         elif field_path is not None:
-            field = _resolve_field(model, field_path, GroupByFieldNotAllowed)
+            field = _resolve_field(
+                model, field_path, GroupByFieldNotAllowed,
+            )
         else:
             field = None
         extra: dict[str, Any] = {}
@@ -944,10 +1170,170 @@ def _build_aggregate_annotations(
             fraction = _require_fraction(op_args, op, field_path)
             extra["fraction"] = fraction
         alias = aggregate_alias(op, field_path, **extra)
-        annotations[alias] = _build_aggregate_expression(
-            op, field_path, vendor, field, extra,
-        )
+        if traverses_relation:
+            assert field_path is not None
+            annotations[alias] = _build_relation_traversal_subquery(
+                model, op, field_path,
+            )
+        else:
+            annotations[alias] = _build_aggregate_expression(
+                op, field_path, vendor, field, extra,
+            )
     return annotations
+
+
+def _build_relation_traversal_subquery(
+    model: Any, op: AggregateOp, field_path: str,
+) -> Aggregate:
+    """Emit a correlated ``Subquery``-wrapped aggregate for a measure
+    that traverses a one-to-many or many-to-many relation.
+
+    Strategy: for each outer row, a correlated ``Subquery`` computes
+    the per-row child aggregate (e.g. ``SUM(items.price)`` for that
+    one order). The outer aggregate then folds those per-row values
+    across the GROUP BY / ``.aggregate()`` scope.
+
+    For a path like ``items__price`` on an ``Order`` queryset with
+    ``op=SUM``:
+
+    .. code-block:: sql
+
+        -- Conceptually:
+        SELECT SUM(per_order_sum)
+        FROM (
+            SELECT
+                "tests_order"."id",
+                (
+                    SELECT SUM(U0."price")
+                    FROM "tests_orderitem" U0
+                    WHERE U0."order_id" = "tests_order"."id"
+                    GROUP BY U0."order_id"
+                ) AS per_order_sum
+            FROM "tests_order"
+        )
+
+    The Subquery wrapper isolates the child fan-out from the outer
+    query — the outer SUM iterates over OUTER rows (one per Order),
+    so any other measure on Order (e.g. ``SUM(total)``) is computed
+    against the same un-multiplied row set. CLAUDE.md Critical Rule 4
+    is preserved precisely because each child fan-out is collapsed
+    inside its own scalar subquery before the outer aggregation runs.
+
+    Only ``COUNT`` / ``COUNT_DISTINCT`` / ``SUM`` / ``AVG`` / ``MIN``
+    / ``MAX`` are accepted at the call site (validated in
+    :func:`_build_aggregate_annotations`).
+    """
+    chain, leaf_model, leaf_name = _resolve_traversal_chain(
+        model, field_path,
+    )
+    # The first segment in the chain is the relation off the OUTER
+    # model. We need the FK accessor on the LEAF subquery side that
+    # points back to the outer model's pk. For a reverse o2m, the
+    # ``field`` attribute on the ManyToOneRel descriptor is the
+    # forward FK on the child; its ``name`` is the lookup we want.
+    first = chain[0]
+    if getattr(first, "one_to_many", False):
+        # Reverse FK: ``Order.items`` → ``OrderItem.order``.
+        outer_filter_name = first.field.name
+    elif getattr(first, "many_to_many", False):
+        # m2m: ``remote_field.name`` is the m2m accessor on the
+        # related model that points at the outer model.
+        outer_filter_name = first.remote_field.name
+    elif getattr(first, "many_to_one", False):
+        # Forward FK on the outer model — pathological for an o2m
+        # measure but the user opted in. Match the leaf's own pk
+        # against the outer FK column.
+        outer_filter_name = "pk"
+    else:
+        outer_filter_name = getattr(
+            getattr(first, "remote_field", None), "name", "pk",
+        ) or "pk"
+
+    # Inner ``__``-path through the rest of the chain to the leaf
+    # field. For ``items__price`` on Order, chain[1:] is empty and
+    # the inner path is just ``"price"``.
+    inner_segments: list[str] = [f.name for f in chain[1:]]
+    inner_segments.append(leaf_name)
+    inner_path = "__".join(inner_segments)
+
+    # Subquery groups the leaf rows by the outer-FK column (so the
+    # subquery yields exactly one row per outer parent), applies the
+    # inner aggregate, and projects the scalar. ``.values(fk)`` before
+    # ``.annotate(...)`` is the canonical Django GROUP BY shape.
+    inner_qs = leaf_model.objects.filter(
+        **{outer_filter_name: OuterRef("pk")}
+    ).values(outer_filter_name)
+
+    inner_agg: Aggregate
+    if op is AggregateOp.COUNT:
+        inner_agg = Count("pk")
+    elif op is AggregateOp.COUNT_DISTINCT:
+        inner_agg = Count(inner_path, distinct=True)
+    elif op is AggregateOp.SUM:
+        inner_agg = Sum(inner_path)
+    elif op is AggregateOp.AVG:
+        inner_agg = Avg(inner_path)
+    elif op is AggregateOp.MIN:
+        inner_agg = Min(inner_path)
+    elif op is AggregateOp.MAX:
+        inner_agg = Max(inner_path)
+    else:  # pragma: no cover — guarded at the call site.
+        raise AggregateError(
+            f"Operator {op.value!r} is not supported with "
+            f"`allow_relation_traversal=True` in v1.0."
+        )
+
+    inner_qs = inner_qs.annotate(_=inner_agg).values("_")
+    inner_output = _output_field_for_traversal(op, leaf_model, leaf_name)
+    per_row = Subquery(inner_qs, output_field=inner_output)
+
+    # Wrap the per-row Subquery in the outer aggregate so the outer
+    # query folds per-row values across the GROUP BY / aggregate
+    # scope. SUM stays SUM (sum-of-sums == sum); COUNT becomes SUM
+    # (sum-of-per-row-counts == total count); AVG / MIN / MAX use
+    # their corresponding outer aggregate. This is what isolates
+    # the child fan-out from any other measure on the outer query.
+    outer_kwargs: dict[str, Any] = {}
+    if inner_output is not None:
+        outer_kwargs["output_field"] = inner_output
+    if op in (AggregateOp.COUNT, AggregateOp.COUNT_DISTINCT, AggregateOp.SUM):
+        # Outer SUM folds per-row Subquery values across the GROUP BY
+        # / aggregate scope. SQL ``SUM(...)`` ignores NULL inputs by
+        # default, so a parent row with zero children (NULL Subquery
+        # value) does not poison the outer total — it contributes
+        # nothing, which matches the "no children → no contribution"
+        # semantics callers expect.
+        return Sum(per_row, **outer_kwargs)
+    if op is AggregateOp.AVG:
+        return Avg(per_row, **outer_kwargs)
+    if op is AggregateOp.MIN:
+        return Min(per_row, **outer_kwargs)
+    if op is AggregateOp.MAX:
+        return Max(per_row, **outer_kwargs)
+    raise AggregateError(  # pragma: no cover — guarded at the call site.
+        f"Operator {op.value!r} is not supported with "
+        f"`allow_relation_traversal=True` in v1.0."
+    )
+
+
+def _output_field_for_traversal(
+    op: AggregateOp, leaf_model: Any, leaf_name: str,
+) -> Any:
+    """Resolve the output_field for a Subquery-emitted aggregate.
+
+    COUNT / COUNT_DISTINCT always return integer rowcounts. SUM / AVG /
+    MIN / MAX inherit the leaf field's natural output type (Decimal,
+    Float, Integer, etc.) — Django's ``_output_field_or_none`` hook is
+    the documented way to ask the field what it would emit.
+    """
+    if op in (AggregateOp.COUNT, AggregateOp.COUNT_DISTINCT):
+        return IntegerField()
+    try:
+        leaf_field = leaf_model._meta.get_field(leaf_name)
+    except Exception:
+        return None
+    of = getattr(leaf_field, "_output_field_or_none", None)
+    return of() if callable(of) else None
 
 
 def _require_fraction(

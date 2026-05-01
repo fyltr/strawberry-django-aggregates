@@ -880,18 +880,60 @@ Returns a flat list of dicts. Group-by keys live alongside aggregate aliases on 
 | `HavingFieldNotAllowed` | `having` references an unknown alias |
 | `GranularityNotApplicable` | `granularity` is set on a non-date / non-datetime field |
 
-## 11 · Why no auto-traversal for o2m / m2m measures
+## 11 · Why no auto-traversal for o2m / m2m measures (and the explicit opt-in)
 
-`SUM(order.items__price)` would silently row-multiply (one row per item, summed multiple times) and corrupt every other measure in the same query. **Refuse the request.** Mirrors Odoo's design choice. The error message points to the explicit alternative:
+### Default behaviour: refuse
+
+`SUM(order.items__price)` would silently row-multiply (one row per item, summed multiple times via the implicit JOIN) and corrupt every other measure in the same query. **By default, `compute_aggregation` refuses** any measure whose ``field_path`` traverses a one-to-many or many-to-many relation. Mirrors Odoo's design choice. The error message points at both the canonical alternative AND the explicit opt-in flag (below):
 
 ```
 AggregationAcrossRelationError:
-  Cannot aggregate `items__price` from `Order` — would cause row multiplication.
-  Use a top-level `itemsAggregate(filter: { order: { id: $orderId } })` query
-  on the child model instead.
+  Cannot aggregate across relation `items__price` from `Order` — would cause
+  silent row multiplication. Query the related model directly with the parent
+  FK in `group_by` instead, or pass `allow_relation_traversal=True` to
+  `compute_aggregation` to opt into Subquery-emitted measures.
 ```
 
-`array_agg` is the explicit escape hatch for "give me all child IDs per parent group" — but it returns `[ID!]`, not auto-hydrated objects. Clients refetch by ID and the optimizer batches the lookup.
+`array_agg` remains the explicit escape hatch for "give me all child IDs per parent group" — it returns `[ID!]`, not auto-hydrated objects. Clients refetch by ID and the optimizer batches the lookup.
+
+### Opt-in: `allow_relation_traversal=True`
+
+Callers who need a measure across a relation can pass `allow_relation_traversal=True` on the backend primitive `compute_aggregation`. When set:
+
+- Each relation-traversing measure is compiled into a correlated `Subquery` per measure (one scalar `Subquery` per measure, not a JOIN). The subquery groups the leaf rows by the outer-FK column so it yields exactly one value per parent; the outer aggregate then folds those per-row values across the GROUP BY / `.aggregate()` scope.
+- The Subquery wrapper isolates each child fan-out — independent measures on the outer queryset (e.g. another `SUM("total")` on `Order`) are computed against the un-multiplied outer rows, preserving their values exactly. This is precisely the row-multiplication trap the default behaviour avoids.
+
+Conceptual SQL shape (PG; SQLite emits a cast-wrapped equivalent):
+
+```sql
+SELECT SUM(per_order_sum) AS sum_items__price
+FROM (
+    SELECT
+        "tests_order"."id",
+        (
+            SELECT SUM(U0."price")
+            FROM "tests_orderitem" U0
+            WHERE U0."order_id" = "tests_order"."id"
+            GROUP BY U0."order_id"
+        ) AS per_order_sum
+    FROM "tests_order"
+)
+```
+
+#### v1.0 restrictions
+
+The flag is intentionally narrow in v1.0:
+
+- **Supported operators**: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, `COUNT_DISTINCT` only. Other operators (`STDDEV`, `VARIANCE`, `STDDEV_POP`, `VAR_POP`, `PERCENTILE_CONT`, `PERCENTILE_DISC`, `MODE`, `ARRAY_AGG`, `STRING_AGG`, `BOOL_AND`, `BOOL_OR`, `COUNT_DISTINCT_TUPLE`) raise `AggregateError` with a clear v1.0-limitation message rather than emitting incorrect SQL. The unsupported-op check runs BEFORE the Postgres-only vendor check, so the v1.0 message wins on every vendor.
+- **Measures only**: `group_by` paths still cannot traverse one-to-many or many-to-many relations even with the flag set. Group-by traversal would row-multiply the OUTER query and corrupt every measure regardless of any subquery isolation downstream.
+- **Empty children**: a parent row with zero matching children produces a `NULL` in the per-row Subquery (the inner `GROUP BY` yields no rows). The outer `SUM` ignores `NULL` inputs by default — for `COUNT` / `COUNT_DISTINCT` this surfaces as `None` in result rows when the parent group has zero children. Callers who need a `0` surface should `COALESCE` post-fetch.
+
+#### Where the flag lives
+
+This flag is on the **backend primitive only**. `AggregateBuilder` and the GraphQL surface do **not** expose it. Two reasons:
+
+1. **CLAUDE.md Critical Rule 9** — `compiler.py` is framework-agnostic. The flag is a primitive concern about how an aggregate is compiled to SQL, not a GraphQL-shape concern.
+2. **CLAUDE.md Critical Rule 4** — the row-multiplication trap is the default protection. Wire-side callers should not be able to opt themselves into it; if a wire-side use case needs traversal, the wiring layer (e.g. django-angee) constructs a `compute_aggregation` call with the flag set and exposes a vetted resolver, never a generic "let any client traverse anything" knob.
 
 ## 12 · Determinism
 

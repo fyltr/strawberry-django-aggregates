@@ -66,14 +66,31 @@ section + tests + per-field-type default-allowlist update.
 ## 4. No auto-traversal of one-to-many or many-to-many for measures
 
 `SUM(parent.children__field)` silently row-multiplies and corrupts every measure
-in the same query. **Refuse the request** with `AggregationAcrossRelationError`.
-The error message must point to the explicit alternative ("query the child model
-with the parent FK in `group_by`"). `array_agg` is the only escape hatch and it
-returns IDs only — never auto-hydrate.
+in the same query. **Refuse the request by default** with
+`AggregationAcrossRelationError`. The error message must point to the explicit
+alternative ("query the child model with the parent FK in `group_by`") AND the
+opt-in flag (below). `array_agg` is the historical escape hatch for
+"give me child IDs per parent group" and it returns IDs only — never
+auto-hydrate.
 
 This is Odoo's load-bearing design choice (`_read_group` refuses for the same
-reason) and we follow. Don't be tempted to "make it work" with a Subquery
-emission strategy in v1; it's a v2 conversation requiring its own SPEC section.
+reason) and we follow as the default.
+
+An explicit opt-in flag `allow_relation_traversal=True` exists on
+`compute_aggregation` for callers who genuinely need a Subquery-emitted measure
+over a one-to-many or many-to-many relation. When set, each traversing measure
+is compiled into a correlated `Subquery` per measure (one scalar `Subquery` per
+measure, not a JOIN), so each child fan-out is collapsed inside its own
+subquery before the outer aggregate runs and other measures on the outer
+queryset are unaffected. v1.0 restricts the supported operators to `SUM`,
+`AVG`, `MIN`, `MAX`, `COUNT`, `COUNT_DISTINCT` and applies only to MEASURES —
+`group_by` paths still cannot traverse relations even with the flag. Default
+behaviour is unchanged.
+
+**Do not surface this flag through `AggregateBuilder` or GraphQL** — it stays
+a primitive-level escape hatch (Critical Rule 9 separation; the wiring layer
+constructs a `compute_aggregation` call with the flag set if it has a vetted
+use case, never exposes a generic "let any client traverse anything" knob).
 
 ## 5. Timezone wrap BEFORE truncate
 
@@ -169,8 +186,11 @@ strawberry-django-aggregates/
   framework-agnostic. Strawberry imports live only in `types.py` and `builder.py`.
 - **Adding a "lazy" mode for grouped queries.** Odoo's `lazy=True` was confusing
   for years and was removed in 17. We never ship it.
-- **Tempted to auto-emit a Subquery for `parent.children__measure`.** No.
-  Critical Rule 4. Document the child-model alternative; raise the error.
+- **Tempted to auto-emit a Subquery for `parent.children__measure` by default.**
+  No. Critical Rule 4 — default refuses. The opt-in
+  `allow_relation_traversal=True` flag exists on `compute_aggregation` for the
+  vetted use case; it does not change the default and is not surfaced through
+  `AggregateBuilder` / GraphQL.
 - **Using `f"{field}"` or `% field` to build SQL.** Use `django.db.models.functions`
   and `Aggregate` subclasses. Never string-format SQL.
 - **Letting an operator string reach the database.** All operator dispatch happens
