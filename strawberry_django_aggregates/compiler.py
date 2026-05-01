@@ -24,6 +24,7 @@ from django.db.models import (
     Aggregate,
     Avg,
     BooleanField,
+    CharField,
     Count,
     DateField,
     DateTimeField,
@@ -37,9 +38,10 @@ from django.db.models import (
     StdDev,
     Sum,
     TimeField,
+    Value,
     Variance,
 )
-from django.db.models.functions import Extract, Trunc
+from django.db.models.functions import Coalesce, Concat, Extract, Trunc
 from django.db.models.functions.datetime import TimezoneMixin
 
 from strawberry_django_aggregates.errors import (
@@ -225,6 +227,29 @@ class _Mode(Aggregate):
 
     function = "MODE"
     template = "%(function)s() WITHIN GROUP (ORDER BY %(expressions)s)"
+
+
+# ---------------------------------------------------------------------------
+# Multi-column COUNT(DISTINCT (a, b, c)) — Hasura-style ``count_distinct``
+# with a tuple of fields. PG renders the SQL row constructor natively;
+# SQLite has no row-constructor in DISTINCT, so we emulate via a
+# null-sentinel-coalesced concatenation. The emulation diverges from PG
+# semantics when any column in the tuple is NULL — see SPEC § 5 caveat.
+# ---------------------------------------------------------------------------
+
+
+class _Tuple(Func):
+    """SQL row-constructor — ``(a, b, c)``.
+
+    Used as the inner expression of a ``COUNT(DISTINCT ...)`` so that
+    PostgreSQL evaluates DISTINCT against the tuple as a whole.
+    Emitting a row constructor (not a function call) needs an empty
+    ``function`` string; the template provides the parens.
+    """
+
+    function = ""
+    template = "(%(expressions)s)"
+    arg_joiner = ", "
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +523,18 @@ def _build_aggregate_annotations(
 ) -> dict[str, Aggregate]:
     annotations: dict[str, Aggregate] = {}
     for op, field_path in aggregates:
-        if field_path is not None:
+        field: Field | None
+        if op is AggregateOp.COUNT_DISTINCT_TUPLE:
+            # Multi-segment path encoded as ``a__b__c`` — validate each
+            # segment as a single-field name on the model. The
+            # COUNT_DISTINCT_TUPLE branch in
+            # :func:`_build_aggregate_expression` operates on the raw
+            # segment list, not on a single Field.
+            assert field_path is not None
+            for segment in field_path.split("__"):
+                _resolve_field(model, segment, GroupByFieldNotAllowed)
+            field = None
+        elif field_path is not None:
             field = _resolve_field(model, field_path, GroupByFieldNotAllowed)
         else:
             field = None
@@ -544,6 +580,8 @@ def aggregate_alias(
 
     - ``(COUNT, None)`` → ``"count"``
     - ``(COUNT_DISTINCT, "customer")`` → ``"count_distinct_customer"``
+    - ``(COUNT_DISTINCT_TUPLE, "customer__status")`` →
+      ``"count_distinct_tuple_customer__status"``
     - ``(SUM, "total")`` → ``"sum_total"``
     - ``(PERCENTILE_CONT, "total", fraction=0.5)`` →
       ``"percentile_cont_total_50"``
@@ -555,6 +593,11 @@ def aggregate_alias(
     as an integer percentile (``0.5`` → ``50``; ``0.05`` → ``5``;
     ``0.999`` → ``999``). This lets multiple percentile calls coexist
     in the same query without alias collisions.
+
+    ``COUNT_DISTINCT_TUPLE`` aliases preserve the ``__``-joined
+    field-path string verbatim — the path encodes the canonical
+    sorted-tuple of field names so that the same call shape always
+    produces the same alias regardless of input order at the wire.
     """
     if op is AggregateOp.COUNT:
         return "count"
@@ -607,6 +650,10 @@ def _build_aggregate_expression(
     if op is AggregateOp.COUNT_DISTINCT:
         assert field_path is not None
         return Count(field_path, distinct=True)
+    if op is AggregateOp.COUNT_DISTINCT_TUPLE:
+        assert field_path is not None
+        segments = field_path.split("__")
+        return _build_count_distinct_tuple(segments, vendor)
     if op is AggregateOp.SUM:
         return Sum(field_path)  # type: ignore[arg-type]
     if op is AggregateOp.AVG:
@@ -667,6 +714,62 @@ def _bool_or(field_path: str | None, vendor: str) -> Aggregate:
         from django.contrib.postgres.aggregates import BoolOr
         return BoolOr(field_path)
     return Max(field_path, output_field=BooleanField())  # type: ignore[arg-type]
+
+
+# Sentinel used in the SQLite emulation of multi-column COUNT(DISTINCT).
+# NUL byte (``\x00``) is the conventional "definitely not in user data"
+# choice; no human-readable string column should legitimately contain
+# it. The SQLite caveat (any tuple containing a NULL column collapses
+# to a SHARED sentinel-coded tuple, so its distinct contribution
+# differs from PG's "any NULL excludes the tuple") is documented in
+# SPEC § 5. The separator (``\x01``) is a different control byte so a
+# value that happens to contain the sentinel literally cannot collide
+# with the boundary marker.
+_TUPLE_NULL_SENTINEL = "\x00"
+_TUPLE_SEPARATOR = "\x01"
+
+
+def _build_count_distinct_tuple(
+    segments: list[str], vendor: str,
+) -> Aggregate:
+    """Emit ``COUNT(DISTINCT (<segments>))`` per vendor.
+
+    PostgreSQL: native row constructor — ``COUNT(DISTINCT (a, b, c))``.
+    Standard-SQL semantics — any tuple where any column is NULL is
+    excluded from the distinct set.
+
+    SQLite: emulated via NULL-sentinel-coalesced concatenation, since
+    SQLite has no row constructor in DISTINCT contexts. The emulation
+    diverges from PG when any column is NULL — see SPEC § 5 caveat.
+    """
+    if vendor == "postgresql":
+        return Count(_Tuple(*[F(seg) for seg in segments]), distinct=True)
+
+    # SQLite emulation: COUNT(DISTINCT COALESCE(a, '\\0') || '\\1' || ...).
+    # Each column is wrapped in COALESCE → sentinel; columns are joined
+    # with a separator that differs from the sentinel so a value
+    # containing the sentinel literally cannot collide with the
+    # boundary. Cast to text via ``output_field=CharField()`` on the
+    # COALESCE so non-string columns (FKs, dates, decimals) render
+    # uniformly.
+    parts: list[Any] = []
+    for i, seg in enumerate(segments):
+        if i > 0:
+            parts.append(Value(_TUPLE_SEPARATOR))
+        parts.append(
+            Coalesce(
+                F(seg),
+                Value(_TUPLE_NULL_SENTINEL),
+                output_field=CharField(),
+            ),
+        )
+    if len(parts) == 1:
+        # Single-segment tuple is unusual — the caller should use
+        # COUNT_DISTINCT instead — but for symmetry we still produce
+        # COUNT(DISTINCT COALESCE(a, '\\0')) without a Concat wrapper
+        # (Concat with one arg is a no-op in Django but adds a CASE).
+        return Count(parts[0], distinct=True)
+    return Count(Concat(*parts, output_field=CharField()), distinct=True)
 
 
 # ---------------------------------------------------------------------------

@@ -22,23 +22,24 @@ class AggregateOp(StrEnum):
     connections.
     """
 
-    COUNT           = "count"
-    COUNT_DISTINCT  = "count_distinct"
-    SUM             = "sum"
-    AVG             = "avg"
-    MIN             = "min"
-    MAX             = "max"
-    STDDEV          = "stddev"           # Postgres only — sample stddev
-    VARIANCE        = "variance"         # Postgres only — sample variance
-    STDDEV_POP      = "stddev_pop"       # Postgres only — population stddev
-    VAR_POP         = "var_pop"          # Postgres only — population variance
-    PERCENTILE_CONT = "percentile_cont"  # PG only — interpolated percentile
-    PERCENTILE_DISC = "percentile_disc"  # PG only — discrete percentile
-    MODE            = "mode"             # PG only — most-frequent value
-    BOOL_AND        = "bool_and"
-    BOOL_OR         = "bool_or"
-    ARRAY_AGG       = "array_agg"        # Postgres only
-    STRING_AGG      = "string_agg"       # Postgres only
+    COUNT                = "count"
+    COUNT_DISTINCT       = "count_distinct"
+    COUNT_DISTINCT_TUPLE = "count_distinct_tuple"
+    SUM                  = "sum"
+    AVG                  = "avg"
+    MIN                  = "min"
+    MAX                  = "max"
+    STDDEV               = "stddev"           # PG only — sample stddev
+    VARIANCE             = "variance"         # PG only — sample variance
+    STDDEV_POP           = "stddev_pop"       # PG only — population stddev
+    VAR_POP              = "var_pop"          # PG only — population var
+    PERCENTILE_CONT      = "percentile_cont"  # PG only — interpolated pct
+    PERCENTILE_DISC      = "percentile_disc"  # PG only — discrete pct
+    MODE                 = "mode"             # PG only — most-frequent value
+    BOOL_AND             = "bool_and"
+    BOOL_OR              = "bool_or"
+    ARRAY_AGG            = "array_agg"        # Postgres only
+    STRING_AGG           = "string_agg"       # Postgres only
 
 
 # Operators each Django field type gets without explicit override.

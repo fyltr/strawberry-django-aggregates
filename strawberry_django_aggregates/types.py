@@ -151,6 +151,7 @@ class Granularity(enum.Enum):
 _ROW_OPERATORS: tuple[AggregateOp, ...] = (
     AggregateOp.COUNT,
     AggregateOp.COUNT_DISTINCT,
+    AggregateOp.COUNT_DISTINCT_TUPLE,
 )
 
 # Operators that materialize a `<Model>{Op}Fields` nested type.
@@ -431,20 +432,58 @@ def make_aggregate_type(
 
     # count_distinct is a method-style field (takes a `field` argument)
     # so we attach it via class body, not the dataclass field list.
-    def _count_distinct_resolver(self: Any, field: Any) -> int:
-        # Backing dict lives on `self.__count_distinct__`; populated by
-        # the resolver in builder.py.
-        backing = getattr(self, "__count_distinct__", None) or {}
-        return int(backing.get(field.value, 0))
+    #
+    # Accepts EITHER ``field: <Enum>`` (single column — emits
+    # ``COUNT(DISTINCT a)``) OR ``fields: [<Enum>!]`` (multi-column
+    # tuple — emits ``COUNT(DISTINCT (a, b, c))`` per SPEC § 5
+    # Hasura-style sub-section). Exactly one of the two must be set;
+    # both-set or neither-set raises a ``ValueError`` at resolver
+    # entry. The single-field shape is backward-compatible with the
+    # pre-Stream-8 wire format.
+    def _count_distinct_resolver(
+        self: Any,
+        field: Any = strawberry.UNSET,
+        fields: Any = strawberry.UNSET,
+    ) -> int:
+        single_set = (
+            field is not strawberry.UNSET and field is not None
+        )
+        multi_set = (
+            fields is not strawberry.UNSET and fields is not None
+        )
+        if single_set == multi_set:
+            raise ValueError(
+                "countDistinct: pass exactly one of `field` "
+                "(single-column) or `fields` (multi-column tuple). "
+                f"Got field={field!r}, fields={fields!r}.",
+            )
+        if single_set:
+            backing = getattr(self, "__count_distinct__", None) or {}
+            return int(backing.get(field.value, 0))
+        # Multi-column tuple — key on a sorted tuple of field-name
+        # strings so wire-input order does not affect the lookup.
+        tuple_backing = (
+            getattr(self, "__count_distinct_tuple__", None) or {}
+        )
+        key = tuple(sorted(f.value for f in fields))
+        return int(tuple_backing.get(key, 0))
 
     _count_distinct_resolver.__annotations__ = {
         "self":   Any,
-        "field":  countable_enum,
+        "field":  countable_enum | None,
+        # ``list[countable_enum] | None`` is a runtime-built type
+        # Strawberry consumes correctly, but mypy can't statically
+        # subscript a ``Variable`` by ``list[...]`` so we suppress.
+        "fields": list[countable_enum] | None,  # type: ignore[valid-type]
         "return": int,
     }
     cls.count_distinct = strawberry.field(  # type: ignore[attr-defined]
         resolver=_count_distinct_resolver,
-        description="COUNT(DISTINCT <field>) — pass the field to count.",
+        description=(
+            "COUNT(DISTINCT <field>) for a single column, or "
+            "COUNT(DISTINCT (a, b, c)) for a multi-column tuple. "
+            "Pass exactly one of `field` or `fields`."
+        ),
     )
 
     # PERCENTILE_CONT / PERCENTILE_DISC are method-style for the same

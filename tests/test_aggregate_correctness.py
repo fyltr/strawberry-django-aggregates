@@ -454,3 +454,122 @@ def test_stddev_pop_var_pop_correctness(sample_orders):
     # population variance for this fixture (N=6, all-non-null).
     assert row["variance_total"] > row["var_pop_total"]
     assert row["stddev_total"] > row["stddev_pop_total"]
+
+
+# ---------------------------------------------------------------------------
+# Multi-column count_distinct (Hasura-style) — Stream 8.
+#
+# COUNT_DISTINCT_TUPLE accepts a ``__``-joined field path encoding the
+# canonical sorted-tuple of segment names. PG emits a native
+# ``COUNT(DISTINCT (a, b, c))`` row constructor; SQLite emulates via
+# COALESCE/Concat with a NULL sentinel — see SPEC § 5 for the
+# documented divergence on NULL columns.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_count_distinct_tuple_two_columns(sample_orders):
+    """Six-row fixture has these (customer, status) tuples:
+
+    - (Alpha, paid)      x3   (o1, o2, o6)
+    - (Beta,  paid)      x1   (o3)
+    - (Beta,  cancelled) x1   (o4)
+    - (Gamma, draft)     x1   (o5)
+
+    Distinct (customer, status) tuples: 4.
+    """
+    from tests.models import Order
+
+    rows = compute_aggregation(
+        Order.objects.all(),
+        aggregates=[
+            (AggregateOp.COUNT_DISTINCT_TUPLE, "customer__status"),
+            # Sanity: single-column count_distinct on the same fixture.
+            (AggregateOp.COUNT_DISTINCT, "customer"),
+            (AggregateOp.COUNT_DISTINCT, "status"),
+        ],
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["count_distinct_tuple_customer__status"] == 4
+    # 3 customers * 3 statuses would give 9 if the tuple op silently
+    # devolved to a Cartesian product; we want strict tuple distinct.
+    assert row["count_distinct_tuple_customer__status"] != 9
+    # Single-column distincts on the same data, for cross-check.
+    assert row["count_distinct_customer"] == 3
+    assert row["count_distinct_status"] == 3
+
+
+@pytest.mark.django_db
+def test_count_distinct_tuple_alias_uses_double_underscore(sample_orders):
+    """Path-encoding decision (Stream 8): the SQL alias is
+    ``count_distinct_tuple_<segments_joined_by_double_underscore>``.
+    """
+    from strawberry_django_aggregates.compiler import aggregate_alias
+    from tests.models import Order
+
+    alias = aggregate_alias(
+        AggregateOp.COUNT_DISTINCT_TUPLE, "customer__status",
+    )
+    assert alias == "count_distinct_tuple_customer__status"
+
+    rows = compute_aggregation(
+        Order.objects.all(),
+        aggregates=[
+            (AggregateOp.COUNT_DISTINCT_TUPLE, "customer__status"),
+        ],
+    )
+    assert alias in rows[0]
+
+
+@pytest.mark.django_db
+def test_count_distinct_tuple_three_columns(sample_orders):
+    """Tuple over (customer, status, is_priority).
+
+    The fixture's six rows decompose as:
+      (Alpha, paid,      True)  — o1
+      (Alpha, paid,      False) — o2
+      (Alpha, paid,      True)  — o6      ← duplicate of o1's tuple
+      (Beta,  paid,      True)  — o3
+      (Beta,  cancelled, False) — o4
+      (Gamma, draft,     False) — o5
+
+    Distinct triples: 5 (o1 == o6).
+    """
+    from tests.models import Order
+
+    rows = compute_aggregation(
+        Order.objects.all(),
+        aggregates=[
+            (
+                AggregateOp.COUNT_DISTINCT_TUPLE,
+                "customer__is_priority__status",
+            ),
+        ],
+    )
+    assert len(rows) == 1
+    alias = "count_distinct_tuple_customer__is_priority__status"
+    assert rows[0][alias] == 5
+
+
+@pytest.mark.django_db
+def test_count_distinct_tuple_validates_segments(db):
+    """Each ``__``-separated segment must resolve to a real model
+    field. An unknown segment raises just like single-column
+    count_distinct does on a bad field name.
+    """
+    from strawberry_django_aggregates.errors import (
+        GroupByFieldNotAllowed,
+    )
+    from tests.models import Order
+
+    with pytest.raises(GroupByFieldNotAllowed):
+        compute_aggregation(
+            Order.objects.all(),
+            aggregates=[
+                (
+                    AggregateOp.COUNT_DISTINCT_TUPLE,
+                    "customer__nope_not_a_field",
+                ),
+            ],
+        )

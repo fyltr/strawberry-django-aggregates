@@ -493,16 +493,42 @@ class AggregateBuilder:
                 yield (op, None)
                 continue
             if op is AggregateOp.COUNT_DISTINCT:
-                # The countable enum's MEMBER NAME (e.g. "TOTAL") is
-                # what arrives in arguments. Map back to the field
-                # path (e.g. "total") via the runtime enum class.
+                # ``countDistinct`` accepts EITHER ``field: Enum`` for
+                # single-column distinct (emits COUNT_DISTINCT) OR
+                # ``fields: [Enum!]`` for multi-column tuple distinct
+                # (emits COUNT_DISTINCT_TUPLE). Per SPEC § 5
+                # Hasura-style sub-section. Mutual exclusion is
+                # enforced at the resolver level (in ``types.py``); we
+                # additionally guard here so the SQL annotation isn't
+                # built with an empty / contradictory spec.
                 args = getattr(inner, "arguments", {}) or {}
                 field_arg = args.get("field")
-                if field_arg is None:
+                fields_arg = args.get("fields")
+                single_set = field_arg is not None
+                multi_set = fields_arg is not None and len(fields_arg) > 0
+                if single_set == multi_set:
+                    # Both set or neither set — let the resolver raise
+                    # the user-facing error. Don't queue any annotation.
                     continue
-                fname = self._countable_field_to_path(field_arg)
-                if fname is not None:
-                    yield (op, fname)
+                if single_set:
+                    fname = self._countable_field_to_path(field_arg)
+                    if fname is not None:
+                        yield (op, fname)
+                    continue
+                # Multi-column tuple — canonicalize via sorted-tuple of
+                # field names so wire-input order doesn't change the
+                # SQL alias. ``__`` is the segment separator in the
+                # resulting field-path (compiler expects that shape).
+                if fields_arg is None:
+                    continue
+                names = [
+                    self._countable_field_to_path(f) for f in fields_arg
+                ]
+                clean = [n for n in names if n is not None]
+                if not clean:
+                    continue
+                joined = "__".join(sorted(clean))
+                yield (AggregateOp.COUNT_DISTINCT_TUPLE, joined)
                 continue
             if op in {
                 AggregateOp.PERCENTILE_CONT,
@@ -719,12 +745,12 @@ class AggregateBuilder:
             ),
         )
         instance = aggregate_type(**kwargs)
-        # Stash count_distinct lookup table for the resolver method.
-        cd: dict[str, int] = {}
-        for op, fp in requested:
-            if op is AggregateOp.COUNT_DISTINCT and fp is not None:
-                cd[fp] = int(row.get(f"count_distinct_{fp}", 0) or 0)
-        instance.__count_distinct__ = cd  # type: ignore[attr-defined]
+        # Stash count_distinct lookup table for the resolver method —
+        # both the single-column and the multi-column tuple shapes
+        # are populated. Single-column keys on the field-name string;
+        # multi-column keys on a sorted tuple of field-name strings
+        # (matches the wire-side canonicalization).
+        self._populate_count_distinct_backing(instance, row, requested)
         # Stash percentile backing dicts keyed by ``(field, fraction)``
         # so the method-style resolver can pull the right SQL alias —
         # the alias was assigned via the fraction-derived suffix in
@@ -765,8 +791,40 @@ class AggregateBuilder:
         # type — populate the backing dicts defensively so a future
         # method-style addition Just Works™ without re-wiring the
         # shaping path.
+        self._populate_count_distinct_backing(instance, row, requested)
         self._populate_percentile_backing(instance, row, requested, op_args)
         return instance
+
+    @staticmethod
+    def _populate_count_distinct_backing(
+        instance: Any,
+        row: dict[str, Any],
+        requested: list[tuple[AggregateOp, str | None]],
+    ) -> None:
+        """Walk requested ops and populate the two count_distinct
+        backing dicts on ``instance``:
+
+        - ``__count_distinct__[<field_name>] = N``  (single-column)
+        - ``__count_distinct_tuple__[(a, b, c)] = N``  (multi-column,
+          keyed on a sorted tuple of field-name strings — matches the
+          canonicalization in ``_extract_ops_from_grouped`` and the
+          resolver lookup in ``types.py``).
+        """
+        cd_single: dict[str, int] = {}
+        cd_tuple: dict[tuple[str, ...], int] = {}
+        for op, fp in requested:
+            if fp is None:
+                continue
+            if op is AggregateOp.COUNT_DISTINCT:
+                cd_single[fp] = int(
+                    row.get(f"count_distinct_{fp}", 0) or 0,
+                )
+            elif op is AggregateOp.COUNT_DISTINCT_TUPLE:
+                key = tuple(sorted(fp.split("__")))
+                alias = f"count_distinct_tuple_{fp}"
+                cd_tuple[key] = int(row.get(alias, 0) or 0)
+        instance.__count_distinct__ = cd_single  # type: ignore[attr-defined]
+        instance.__count_distinct_tuple__ = cd_tuple  # type: ignore[attr-defined]
 
     @staticmethod
     def _populate_percentile_backing(
@@ -829,6 +887,7 @@ class AggregateBuilder:
             if op in {
                 AggregateOp.COUNT,
                 AggregateOp.COUNT_DISTINCT,
+                AggregateOp.COUNT_DISTINCT_TUPLE,
                 AggregateOp.PERCENTILE_CONT,
                 AggregateOp.PERCENTILE_DISC,
             }:

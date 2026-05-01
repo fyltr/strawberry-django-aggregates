@@ -153,3 +153,139 @@ def test_aggregate_query_with_fragment(order_schema):
     assert data["count"] == 6
     assert data["sum"] is not None
     assert Decimal(data["sum"]["total"]) == Decimal("1125.00")
+
+
+# ---------------------------------------------------------------------------
+# Multi-column countDistinct (Hasura-style) — Stream 8.
+#
+# Single GraphQL surface ``countDistinct(field?, fields?)`` accepts EITHER
+# a single ``field`` argument (backward-compatible single-column distinct)
+# OR a list of ``fields`` (multi-column tuple distinct). Mutually
+# exclusive at the resolver — both-set / neither-set raises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def order_schema_with_fk_countable(sample_orders):
+    """Schema variant whose aggregate_fields include the FK + status
+    columns so they appear in ``OrderCountableField``. Without this, the
+    multi-column count_distinct tests can't reference CUSTOMER / STATUS
+    on the wire (they would parse-error against the enum).
+    """
+    from tests.models import Order
+
+    built = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["total", "quantity", "customer", "status"],
+        group_by_fields=["customer", "status"],
+    ).build()
+
+    @strawberry.type
+    class Query:
+        order_aggregate:  built.aggregate_type     = built.aggregate_field
+        orders_group_by:  built.grouped_result_type = built.group_by_field
+
+    return strawberry.Schema(query=Query), built
+
+
+@pytest.mark.django_db
+def test_count_distinct_single_field_backwards_compatible(
+    order_schema_with_fk_countable,
+):
+    """``countDistinct(field: ...)`` continues to work unchanged."""
+    schema, _ = order_schema_with_fk_countable
+    result = schema.execute_sync("""
+        query {
+            orderAggregate {
+                countDistinct(field: CUSTOMER)
+            }
+        }
+    """)
+    assert result.errors is None, result.errors
+    assert result.data["orderAggregate"]["countDistinct"] == 3
+
+
+@pytest.mark.django_db
+def test_count_distinct_multi_field_tuple(order_schema_with_fk_countable):
+    """``countDistinct(fields: [CUSTOMER, STATUS])`` returns the count
+    of distinct (customer, status) tuples — 4 for the fixture (see the
+    correctness test for the breakdown).
+    """
+    schema, _ = order_schema_with_fk_countable
+    result = schema.execute_sync("""
+        query {
+            orderAggregate {
+                countDistinct(fields: [CUSTOMER, STATUS])
+            }
+        }
+    """)
+    assert result.errors is None, result.errors
+    assert result.data["orderAggregate"]["countDistinct"] == 4
+
+
+@pytest.mark.django_db
+def test_count_distinct_multi_field_order_insensitive(
+    order_schema_with_fk_countable,
+):
+    """Wire-input order of ``fields`` doesn't change the result —
+    canonicalized via sorted-tuple key. Pinning the sort behavior so
+    clients don't accidentally rely on input ordering.
+    """
+    schema, _ = order_schema_with_fk_countable
+    a = schema.execute_sync("""
+        query { orderAggregate {
+            countDistinct(fields: [CUSTOMER, STATUS]) } }
+    """)
+    b = schema.execute_sync("""
+        query { orderAggregate {
+            countDistinct(fields: [STATUS, CUSTOMER]) } }
+    """)
+    assert a.errors is None and b.errors is None
+    assert a.data["orderAggregate"]["countDistinct"] == \
+        b.data["orderAggregate"]["countDistinct"]
+
+
+@pytest.mark.django_db
+def test_count_distinct_neither_field_nor_fields_raises(
+    order_schema_with_fk_countable,
+):
+    """Calling ``countDistinct`` with neither argument raises a clear
+    error rather than silently returning 0 or all-rows.
+    """
+    schema, _ = order_schema_with_fk_countable
+    result = schema.execute_sync("""
+        query {
+            orderAggregate {
+                countDistinct
+            }
+        }
+    """)
+    # Mutual-exclusion validation runs in the resolver — Strawberry
+    # surfaces a single error referencing the field path.
+    assert result.errors is not None
+    messages = [str(e.message) for e in result.errors]
+    assert any(
+        "countDistinct" in m or "exactly one" in m for m in messages
+    ), messages
+
+
+@pytest.mark.django_db
+def test_count_distinct_both_field_and_fields_raises(
+    order_schema_with_fk_countable,
+):
+    """Calling ``countDistinct(field: X, fields: [Y])`` is contradictory
+    and must fail loud.
+    """
+    schema, _ = order_schema_with_fk_countable
+    result = schema.execute_sync("""
+        query {
+            orderAggregate {
+                countDistinct(field: CUSTOMER, fields: [STATUS])
+            }
+        }
+    """)
+    assert result.errors is not None
+    messages = [str(e.message) for e in result.errors]
+    assert any(
+        "exactly one" in m or "countDistinct" in m for m in messages
+    ), messages

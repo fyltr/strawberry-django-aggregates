@@ -155,23 +155,24 @@ enum Granularity {
 
 ```
 AggregateOp = StrEnum:
-    COUNT           = "count"
-    COUNT_DISTINCT  = "count_distinct"
-    SUM             = "sum"
-    AVG             = "avg"
-    MIN             = "min"
-    MAX             = "max"
-    STDDEV          = "stddev"           # Postgres only — sample stddev
-    VARIANCE        = "variance"         # Postgres only — sample variance
-    STDDEV_POP      = "stddev_pop"       # Postgres only — population stddev
-    VAR_POP         = "var_pop"          # Postgres only — population variance
-    PERCENTILE_CONT = "percentile_cont"  # Postgres only — interpolated percentile
-    PERCENTILE_DISC = "percentile_disc"  # Postgres only — discrete percentile
-    MODE            = "mode"             # Postgres only — most-frequent value
-    BOOL_AND        = "bool_and"
-    BOOL_OR         = "bool_or"
-    ARRAY_AGG       = "array_agg"        # Postgres only
-    STRING_AGG      = "string_agg"       # Postgres only
+    COUNT                = "count"
+    COUNT_DISTINCT       = "count_distinct"
+    COUNT_DISTINCT_TUPLE = "count_distinct_tuple"  # multi-column distinct
+    SUM                  = "sum"
+    AVG                  = "avg"
+    MIN                  = "min"
+    MAX                  = "max"
+    STDDEV               = "stddev"           # Postgres only — sample stddev
+    VARIANCE             = "variance"         # Postgres only — sample variance
+    STDDEV_POP           = "stddev_pop"       # Postgres only — population stddev
+    VAR_POP              = "var_pop"          # Postgres only — population variance
+    PERCENTILE_CONT      = "percentile_cont"  # Postgres only — interpolated percentile
+    PERCENTILE_DISC      = "percentile_disc"  # Postgres only — discrete percentile
+    MODE                 = "mode"             # Postgres only — most-frequent value
+    BOOL_AND             = "bool_and"
+    BOOL_OR              = "bool_or"
+    ARRAY_AGG            = "array_agg"        # Postgres only
+    STRING_AGG           = "string_agg"       # Postgres only
 ```
 
 Direct mapping to SQL — no operator outside this enum reaches the database:
@@ -180,6 +181,7 @@ Direct mapping to SQL — no operator outside this enum reaches the database:
 |---|---|---|---|
 | `count` | `COUNT(*)` | All | `Int!` |
 | `count_distinct` | `COUNT(DISTINCT col)` | All | `Int!` |
+| `count_distinct_tuple` | `COUNT(DISTINCT (a, b, c))` (PG); `COUNT(DISTINCT COALESCE(a, '\0') \|\| char(1) \|\| ...)` (SQLite emulation) | All | `Int!` |
 | `sum` | `SUM(col)` | All | `BigInt` for integer field types (`IntegerField`, `SmallIntegerField`, `PositiveIntegerField`, `PositiveSmallIntegerField`, `BigIntegerField`); `Decimal` for `DecimalField`; `Float` for `FloatField`; `Duration` for `DurationField` |
 | `avg` | `AVG(col)` | All | `Float` (or `Decimal` for `DecimalField`) |
 | `min` / `max` | `MIN(col)` / `MAX(col)` | All | type of `col` |
@@ -230,10 +232,10 @@ Standard SQL three-valued-logic applies. Every emitted measure field on
   unless empty-bucket filling is enabled — see § 7.1 once it lands).
 - **`count_distinct(field)`** — `COUNT(DISTINCT col)`, counting **non-null
   distinct values**. NULL is not a distinct value and is excluded.
-  Returns `0` for an all-NULL group, never NULL itself. (Multi-column
-  `count_distinct(fields:)` follows the same rule under standard SQL: any
-  tuple containing a NULL is excluded; SQLite emulation may differ — this
-  caveat is restated when Stream 8 lands.)
+  Returns `0` for an all-NULL group, never NULL itself. Multi-column
+  `count_distinct(fields:)` follows the same rule under standard SQL on
+  PostgreSQL — any tuple containing a NULL is excluded — but the SQLite
+  emulation diverges. See § 5.2 for the full SQLite caveat.
 - **`sum`, `avg`, `min`, `max`, `stddev`, `variance`, `stddev_pop`,
   `var_pop`** — skip NULL inputs. An empty group, or a group whose
   measure column is entirely NULL, returns NULL. **`sum` does NOT default
@@ -341,6 +343,80 @@ or order on the underlying queryset directly if you need either.
 
 **`mode` works in HAVING and ordering** like any other regular nested
 op — its alias is the simple `mode_<field>` form.
+
+### 5.2 · Multi-column `count_distinct` (Hasura-style)
+
+The `<Model>Aggregate` type exposes a single `countDistinct` field that
+accepts EITHER a single `field: <Enum>` argument (single-column distinct
+— emits `COUNT(DISTINCT col)`) OR a `fields: [<Enum>!]` argument
+(multi-column tuple distinct — emits `COUNT(DISTINCT (a, b, c))`):
+
+```graphql
+type OrderAggregate {
+  count: Int!
+  countDistinct(
+    field: OrderCountableField,
+    fields: [OrderCountableField!],
+  ): Int!
+  # ...
+}
+```
+
+**Mutual exclusion** — exactly one of `field` / `fields` must be set.
+Both-set or neither-set raises a `ValueError` at resolver entry, before
+any SQL fires. This is enforced in two places: the resolver in
+`types.py` raises the user-facing error; the wire-walker in
+`builder.py` skips the request to avoid building a contradictory SQL
+annotation.
+
+**Backend operator.** Internally the multi-column shape dispatches via
+the new `AggregateOp.COUNT_DISTINCT_TUPLE` enum member (canonical
+position immediately after `COUNT_DISTINCT`). The compiler accepts a
+`__`-joined field-path (e.g. `"customer__status"`) and validates each
+segment against the model. The wire layer canonicalizes the input
+`fields` list into a sorted-tuple key so `[CUSTOMER, STATUS]` and
+`[STATUS, CUSTOMER]` produce the same SQL alias and result lookup.
+
+**SQL alias scheme.** `(COUNT_DISTINCT_TUPLE, "customer__status")` →
+alias `count_distinct_tuple_customer__status`. The double-underscore
+separator is preserved verbatim in the alias so the alias maps 1:1 to
+the canonical sorted-tuple of segment names.
+
+**SQLite emulation caveat.** PostgreSQL renders the row constructor
+natively: `COUNT(DISTINCT (a, b, c))`, with standard-SQL semantics —
+**any tuple containing a NULL is excluded from the distinct set**.
+SQLite has no row constructor in DISTINCT contexts, so the library
+emulates the operator via NULL-sentinel-coalesced concatenation:
+
+```sql
+COUNT(DISTINCT
+  COALESCE(CAST(a AS TEXT), <\x00>) || <\x01> ||
+  COALESCE(CAST(b AS TEXT), <\x00>) || <\x01> ||
+  COALESCE(CAST(c AS TEXT), <\x00>)
+)
+```
+
+(Sentinel = `\x00` / NUL byte; separator = `\x01` / SOH byte.)
+
+The emulation **diverges from PG when any tuple column is NULL**:
+
+- **PostgreSQL** excludes NULL-containing tuples from the distinct set.
+  `COUNT(DISTINCT (a, b))` over `[(1, NULL), (2, NULL), (1, 2)]` is `1`.
+- **SQLite emulation** treats NULLs as a sentinel-coded value, so
+  NULL-containing tuples DO contribute to the distinct count, just as
+  one shared "NULL-coded" tuple per unique sentinel-pattern.
+  `COUNT(DISTINCT ...)` over the same data is `3`.
+
+This is deliberately undocumented as "fixed" — papering over the
+SQLite divergence with a `FILTER (WHERE ... IS NOT NULL)` clause would
+silently change PG results too. Callers wanting NULL exclusion on
+SQLite should pre-filter via `qs.exclude(<col>__isnull=True)`.
+
+**HAVING and ordering** on `count_distinct_tuple` are not exposed in
+v1.0 — the alias shape (`count_distinct_tuple_customer__status`) does
+not roundtrip cleanly through the static `<Model>Having` input shape
+the same way `count_distinct_<field>` does. Both can be added in v1.x
+if a user need surfaces.
 
 ## 6 · Group-by spec
 
@@ -542,7 +618,7 @@ Type generation produces the same SDL for the same inputs. Rules:
 
 - Iterate field allowlists in declaration order (preserves Python dict insertion order).
 - Iterate operator overrides in `sorted()` key order.
-- Emit operator nested types (`<Model>SumFields` etc.) in canonical operator order: `count, count_distinct, sum, avg, min, max, stddev, variance, stddev_pop, var_pop, percentile_cont, percentile_disc, mode, bool_and, bool_or, array_agg, string_agg`. (`percentile_cont` and `percentile_disc` occupy slots in the canonical order so the enum stays stable, but they are emitted as method-style fields on `<Model>Aggregate` — no nested type — per § 5.1.)
+- Emit operator nested types (`<Model>SumFields` etc.) in canonical operator order: `count, count_distinct, count_distinct_tuple, sum, avg, min, max, stddev, variance, stddev_pop, var_pop, percentile_cont, percentile_disc, mode, bool_and, bool_or, array_agg, string_agg`. (`count_distinct_tuple` is row-level — no nested type — and is emitted as part of the same `countDistinct(...)` method-style field via the optional `fields` argument; see § 5.2. `percentile_cont` and `percentile_disc` occupy slots in the canonical order so the enum stays stable, but they are emitted as method-style fields on `<Model>Aggregate` — no nested type — per § 5.1.)
 - Emit HAVING input fields by `(measure, comparison)` in canonical comparison order: `Gt, Lt, Lte, Gte, Eq, Neq, In, NotIn`.
 - No timestamps, no PRNG, no `datetime.now()`, no `uuid4()`, no insertion-order-sensitive iteration.
 
