@@ -1880,19 +1880,40 @@ def _output_field_for_traversal(
 ) -> Any:
     """Resolve the output_field for a Subquery-emitted aggregate.
 
-    COUNT / COUNT_DISTINCT always return integer rowcounts. SUM / AVG /
-    MIN / MAX inherit the leaf field's natural output type (Decimal,
-    Float, Integer, etc.) — Django's ``_output_field_or_none`` hook is
-    the documented way to ask the field what it would emit.
+    COUNT / COUNT_DISTINCT and SUM-of-integer always return 64-bit on
+    Postgres (``bigint``); use ``BigIntegerField()`` so the outer
+    ``Sum(per_row, output_field=...)`` doesn't truncate to 32-bit when
+    the per-row counts/sums exceed 2**31. SUM-of-decimal / SUM-of-float
+    inherit the leaf field's natural output type via Django's
+    ``_output_field_or_none`` hook. AVG / MIN / MAX inherit verbatim.
     """
     if op in (AggregateOp.COUNT, AggregateOp.COUNT_DISTINCT):
-        return IntegerField()
+        from django.db.models import BigIntegerField
+        return BigIntegerField()
     try:
         leaf_field = leaf_model._meta.get_field(leaf_name)
     except Exception:
         return None
     of = getattr(leaf_field, "_output_field_or_none", None)
-    return of() if callable(of) else None
+    inner = of() if callable(of) else None
+    # SUM over an integer-typed leaf widens to bigint on Postgres, same
+    # rationale as Stream 2's BigInt scalar — keep the precision so the
+    # outer fold doesn't truncate. Decimal / Float / Duration leaves
+    # are unaffected.
+    if op is AggregateOp.SUM and inner is not None:
+        from django.db.models import (
+            BigIntegerField,
+            IntegerField,
+            PositiveIntegerField,
+            PositiveSmallIntegerField,
+            SmallIntegerField,
+        )
+        if isinstance(inner, (
+            IntegerField, SmallIntegerField,
+            PositiveIntegerField, PositiveSmallIntegerField,
+        )) and not isinstance(inner, BigIntegerField):
+            return BigIntegerField()
+    return inner
 
 
 def _require_fraction(

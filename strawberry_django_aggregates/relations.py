@@ -174,6 +174,7 @@ def register_relation_aggregate(
         aggregate_type=aggregate_type,
         filter_type=filter_type,
         get_queryset=get_queryset,
+        json_paths=child_built.json_paths,
     )
     field_obj = strawberry_django.field(
         resolver=resolver,
@@ -212,6 +213,7 @@ def _make_relation_resolver(
     aggregate_type: type,
     filter_type: type | None,
     get_queryset: Callable[[Any, Any], QuerySet] | None,
+    json_paths: dict[str, str] | None = None,
 ) -> Callable[..., Any]:
     """Build the per-row strawberry resolver for the relation
     aggregate field.
@@ -233,15 +235,42 @@ def _make_relation_resolver(
     # public _OP_FROM_WIRE / a_fields path. The relation resolver
     # builds a list of requested ops by walking ``info.selected_fields``
     # exactly the way the top-level aggregate field does.
-    from strawberry_django_aggregates.builder import _OP_FROM_WIRE
+    from strawberry_django_aggregates.builder import (
+        _OP_FROM_WIRE,
+        _to_camel_alias,
+    )
     from strawberry_django_aggregates.types import _resolve_aggregate_fields
+
+    # ``json_paths`` is forwarded from the originating ``BuiltAggregates``
+    # so JSON-path measures (Stream 17) and percentile measures
+    # (Stream 14) work through the relation aggregate path the same way
+    # they do on the top-level aggregate field.
 
     # Compute once per registration: which (op, field) pairs the schema
     # admits for the child. This is the same allowlist the top-level
     # aggregate field uses.
     a_fields = _resolve_aggregate_fields(
-        child_model, None, None,
+        child_model, None, json_paths,
     )
+
+    def _json_alias_to_dotted(name: str) -> str:
+        """Translate a wire-side JSON-path alias back to dotted form.
+
+        Accepts BOTH ``"metadata__region"`` (group_by enum value /
+        Python alias) and ``"metadata_Region"`` (Strawberry's GraphQL
+        camelCasing of the same Python identifier on nested-operator
+        types) and maps either to ``"metadata.region"`` IFF
+        ``metadata.region`` was declared in ``json_paths``. Names that
+        don't match any declared JSON path round-trip unchanged so
+        plain field names continue to work.
+        """
+        if not json_paths:
+            return name
+        for dotted in json_paths:
+            alias = dotted.replace(".", "__")
+            if alias == name or _to_camel_alias(alias) == name:
+                return dotted
+        return name
 
     def _walk_selections(node: Any) -> Any:
         for child in getattr(node, "selections", None) or []:
@@ -252,13 +281,18 @@ def _make_relation_resolver(
 
     def _extract_ops(
         agg_sel: Any,
+        op_args: dict[str, dict[str, Any]],
     ) -> list[tuple[AggregateOp, str | None]]:
         """Walk an Aggregate selection and emit ``(op, field)`` pairs.
 
-        Mirrors :meth:`AggregateBuilder._extract_ops_from_grouped`
-        but only the subset relevant to the top-level aggregate
-        type (no Grouped-shape, no method-style percentile).
-        ``count_distinct`` reads its argument the same way.
+        Mirrors :meth:`AggregateBuilder._extract_ops_from_grouped`.
+        ``count_distinct`` reads its argument the same way; method-
+        style percentile fields populate ``op_args`` with the supplied
+        ``fraction``. JSON-path aliases (Strawberry's camelCased
+        ``metadata_Region`` or the underscore-form ``metadata__region``)
+        are mapped back to their dotted form via
+        :func:`_json_alias_to_dotted` so the compiler routes them
+        through :func:`_resolve_json_path`.
         """
         out: list[tuple[AggregateOp, str | None]] = []
         for inner in _walk_selections(agg_sel):
@@ -295,12 +329,42 @@ def _make_relation_resolver(
                 joined = "__".join(sorted(clean))
                 out.append((AggregateOp.COUNT_DISTINCT_TUPLE, joined))
                 continue
+            if op in {
+                AggregateOp.PERCENTILE_CONT,
+                AggregateOp.PERCENTILE_DISC,
+            }:
+                args = getattr(inner, "arguments", {}) or {}
+                field_arg = args.get("field")
+                fraction_arg = args.get("fraction")
+                if field_arg is None or fraction_arg is None:
+                    continue
+                fname = _arg_to_path(field_arg)
+                if fname is None:
+                    continue
+                fname = _json_alias_to_dotted(fname)
+                out.append((op, fname))
+                # ``op_args`` is keyed by the base alias
+                # (``percentile_cont_total``), NOT the alias with the
+                # fraction suffix — see ``compiler._require_fraction``.
+                base_alias = f"{op.value}_{fname}"
+                op_args.setdefault(
+                    base_alias, {"fraction": fraction_arg},
+                )
+                continue
             for f in _walk_selections(inner):
                 fname = getattr(f, "name", None)
                 if fname is None:
                     continue
+                # Try the wire name verbatim first; if that doesn't match
+                # the allowlist, try translating it as a JSON-path alias.
+                # ``a_fields`` already contains JSON-path entries in
+                # dotted form when ``json_paths`` was configured.
                 if fname in a_fields:
                     out.append((op, fname))
+                    continue
+                dotted = _json_alias_to_dotted(fname)
+                if dotted != fname and dotted in a_fields:
+                    out.append((op, dotted))
         return out
 
     def _resolve_child_queryset(
@@ -315,6 +379,32 @@ def _make_relation_resolver(
         manager = getattr(parent_instance, relation_name)
         return manager.all()
 
+    def _walk_and_compute(qs: QuerySet, info: Any) -> Any:
+        op_args: dict[str, dict[str, Any]] = {}
+        requested: list[tuple[AggregateOp, str | None]] = [
+            (AggregateOp.COUNT, None),
+        ]
+        for sel in getattr(info, "selected_fields", []) or []:
+            requested.extend(_extract_ops(sel, op_args))
+        seen: set[tuple[Any, Any]] = set()
+        deduped: list[tuple[AggregateOp, str | None]] = []
+        for entry in requested:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            deduped.append(entry)
+        rows = compute_aggregation(
+            qs, aggregates=deduped,
+            op_args=op_args or None,
+            json_paths=json_paths,
+        )
+        row = rows[0] if rows else {}
+        return shape_aggregate_row(
+            aggregate_type, row, deduped,
+            op_args=op_args or None,
+            json_paths=json_paths,
+        )
+
     if filter_type is not None:
         def resolver(
             self: Any, info: strawberry.Info, filter: Any = None,
@@ -322,23 +412,7 @@ def _make_relation_resolver(
             qs = _resolve_child_queryset(info, self)
             if filter is not None:
                 qs = apply_filters(filter, qs, info=info)
-            requested: list[tuple[AggregateOp, str | None]] = [
-                (AggregateOp.COUNT, None),
-            ]
-            for sel in getattr(info, "selected_fields", []) or []:
-                requested.extend(_extract_ops(sel))
-            seen: set[tuple[Any, Any]] = set()
-            deduped: list[tuple[AggregateOp, str | None]] = []
-            for entry in requested:
-                if entry in seen:
-                    continue
-                seen.add(entry)
-                deduped.append(entry)
-            rows = compute_aggregation(qs, aggregates=deduped)
-            row = rows[0] if rows else {}
-            return shape_aggregate_row(
-                aggregate_type, row, deduped,
-            )
+            return _walk_and_compute(qs, info)
 
         resolver.__annotations__ = {
             "self":   Any,
@@ -351,23 +425,7 @@ def _make_relation_resolver(
             self: Any, info: strawberry.Info,
         ) -> Any:
             qs = _resolve_child_queryset(info, self)
-            requested: list[tuple[AggregateOp, str | None]] = [
-                (AggregateOp.COUNT, None),
-            ]
-            for sel in getattr(info, "selected_fields", []) or []:
-                requested.extend(_extract_ops(sel))
-            seen: set[tuple[Any, Any]] = set()
-            deduped: list[tuple[AggregateOp, str | None]] = []
-            for entry in requested:
-                if entry in seen:
-                    continue
-                seen.add(entry)
-                deduped.append(entry)
-            rows = compute_aggregation(qs, aggregates=deduped)
-            row = rows[0] if rows else {}
-            return shape_aggregate_row(
-                aggregate_type, row, deduped,
-            )
+            return _walk_and_compute(qs, info)
 
         resolver.__annotations__ = {
             "self":   Any,

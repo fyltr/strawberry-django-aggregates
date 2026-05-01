@@ -87,12 +87,13 @@ _ID_OPS = (
 # field-type defaults above, but keyed on the wire-level type tokens the
 # caller passes in :class:`AggregateBuilder.json_paths`. Per SPEC § 6.1.
 #
-# ``stddev``/``variance``/``stddev_pop``/``var_pop`` are excluded — JSONB
-# casts go through ``Cast(KeyTransform(...))`` which Postgres' window /
-# ordered-set machinery can struggle with through the JSON cast wrap;
-# the simpler SUM/AVG/MIN/MAX/MODE shape is enough for v1.0. ``mode`` is
-# included for numeric/string/date types since it returns the column
-# type and works through the cast.
+# Numeric JSON paths get the same operator surface as native numeric
+# Field types (sum/avg/min/max/stddev/variance/stddev_pop/var_pop) —
+# ``Cast(KeyTextTransform(...))`` widens cleanly through the SQL
+# variance/stddev aggregates on Postgres. ``MODE`` is excluded across
+# all JSON-path types in v1.0 — ordered-set aggregates over the JSON
+# cast wrap (``MODE() WITHIN GROUP (ORDER BY ...)``) are not validated
+# against the casted expression yet; revisit in v1.x.
 _JSON_NUMERIC_OPS = (
     AggregateOp.SUM,
     AggregateOp.AVG,

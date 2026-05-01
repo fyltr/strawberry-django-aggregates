@@ -289,6 +289,7 @@ class AggregateBuilder:
             grouped_connection_edge_type=grouped_connection_edge_type,
             page_info_type=page_info_type,
             grouped_connection_field=grouped_connection_field,
+            json_paths=self.json_paths,
         )
 
     # ------- aggregate field (no group_by) --------------------------------
@@ -1580,6 +1581,12 @@ class BuiltAggregates:
     grouped_connection_edge_type: type | None = None
     page_info_type:               type | None = None
     grouped_connection_field:     Any        = None
+    # Configuration carried from the originating ``AggregateBuilder``
+    # so downstream consumers (notably :func:`register_relation_aggregate`)
+    # can re-emit the same compute-time options. ``None`` means "no
+    # JSON-path allowlist was configured" — JSON-path measures will be
+    # refused if requested.
+    json_paths:                   dict[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1666,15 +1673,14 @@ def _keyset_filter(
         | (Q(a=av) & Q(b__gt=bv))
         | (Q(a=av) & Q(b=bv) & Q(c__gt=cv))
 
-    ``aliases`` and ``values`` must be the same length; mismatched
-    cursors (e.g. user passes a stale cursor with a different
-    group_by spec) silently produce no rows because the conjunction
-    cannot be satisfied — that is the intended fail-soft behaviour
-    for an opaque cursor whose contents are an internal contract.
+    ``aliases`` and ``values`` must be the same length. A length
+    mismatch (e.g. a stale cursor decoded against a freshly-changed
+    ``group_by`` spec) raises ``ValueError`` — fail-loud per Critical
+    Rule 6 so the user sees a clear cursor-mismatch diagnostic
+    instead of silently re-paginating from the start.
 
-    Returns ``None`` when ``aliases`` is empty (a cursor over an
-    empty group_by makes no sense; the caller should never reach
-    here, but failing soft is preferred to crashing).
+    Returns ``None`` only when ``aliases`` is empty (no group_by →
+    no keyset to seek on).
 
     NULL handling: SQL ``>`` / ``<`` against NULL is unknown; the
     resulting filter omits rows where ANY group alias is NULL.
@@ -1682,8 +1688,15 @@ def _keyset_filter(
     """
     from django.db.models import Q
 
-    if not aliases or len(aliases) != len(values):
+    if not aliases:
         return None
+    if len(aliases) != len(values):
+        raise ValueError(
+            f"Cursor decoded to {len(values)} value(s) but the current "
+            f"group_by spec has {len(aliases)} alias(es). The cursor "
+            f"was likely encoded against a different group_by; pass a "
+            f"fresh first-page cursor or adjust the group_by to match.",
+        )
 
     op = "gt" if direction == "gt" else "lt"
     clauses: list[Q] = []

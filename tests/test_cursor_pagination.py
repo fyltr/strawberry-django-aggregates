@@ -571,3 +571,41 @@ def test_cursor_pagination_malformed_cursor_raises(six_buckets_schema):
     assert any(
         "cursor" in m.lower() for m in messages
     ), messages
+
+
+def test_cursor_pagination_stale_cursor_length_mismatch_raises(
+    six_buckets_schema,
+):
+    """A cursor encoded against one ``group_by`` shape does not
+    silently re-paginate from page 1 when re-issued against a
+    different shape — Critical Rule 6 fail-loud.
+
+    Reproduces a stale-cursor scenario by encoding 1 value, then
+    re-issuing with a 2-key group_by; the keyset filter sees a
+    length mismatch and raises rather than silently dropping.
+    """
+    from strawberry_django_aggregates import encode_group_cursor
+
+    schema = six_buckets_schema
+    # A "stale" cursor — 1 value, but the group_by below expects 2.
+    stale_cursor = encode_group_cursor([1])
+    result = schema.execute_sync(
+        '''
+        query Q($after: String!) {
+            ordersGroupBy(
+                groupBy: [{ field: CUSTOMER }, { field: STATUS }]
+                first: 2
+                after: $after
+            ) {
+                edges { cursor }
+            }
+        }
+        ''',
+        variable_values={"after": stale_cursor},
+    )
+    assert result.errors is not None
+    messages = [str(e.message) for e in result.errors]
+    assert any(
+        "cursor" in m.lower() and "value" in m.lower()
+        for m in messages
+    ), messages

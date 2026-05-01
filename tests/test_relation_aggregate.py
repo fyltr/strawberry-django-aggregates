@@ -338,3 +338,75 @@ def test_register_on_forward_field_raises(order_built):
         register_relation_aggregate(
             CustomerType, "name", order_built,
         )
+
+
+# ---------------------------------------------------------------------------
+# JSON-path + percentile measures through the relation field — Streams 14, 17
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_relation_aggregate_supports_json_path_measure(sample_orders):
+    """A child-side ``json_paths`` allowlist must propagate through
+    :func:`register_relation_aggregate` so a parent query can SUM a
+    JSON-path measure on the child rows. Stream 9 + Stream 17.
+    """
+    from tests.models import Customer, Order
+
+    customers, orders = sample_orders
+    # Populate metadata.amount on each order so we have a numeric
+    # JSON-path measure to aggregate. Mirror the order's existing
+    # total so the expected sums are easy to derive.
+    for o in orders:
+        o.metadata = {"amount": str(o.total)}
+        o.save(update_fields=["metadata"])
+
+    order_built = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["total", "metadata.amount"],
+        group_by_fields=["customer"],
+        json_paths={"metadata.amount": "Decimal"},
+    ).build()
+
+    @strawberry_django.type(Customer)
+    class CustomerType:
+        id: int
+        name: str
+
+    register_relation_aggregate(CustomerType, "orders", order_built)
+
+    @strawberry.type
+    class Query:
+        customers: list[CustomerType] = strawberry_django.field()
+
+    schema = strawberry.Schema(query=Query)
+
+    expected_sums = {c.name: Decimal("0") for c in customers}
+    for o in orders:
+        expected_sums[o.customer.name] += o.total
+
+    # JSON-path nested fields camelCase the underscore alias as
+    # ``metadata__amount`` → ``metadata_Amount`` (Strawberry's
+    # auto-camelCasing of double-underscore identifiers).
+    result = schema.execute_sync("""
+        query {
+            customers {
+                name
+                ordersAggregate {
+                    count
+                    sum { metadata_Amount }
+                }
+            }
+        }
+    """)
+    assert result.errors is None, result.errors
+    by_name = {r["name"]: r for r in result.data["customers"]}
+    for name, expected in expected_sums.items():
+        agg = by_name[name]["ordersAggregate"]
+        wire_sum = agg["sum"]["metadata_Amount"]
+        if expected == Decimal("0"):
+            assert wire_sum is None
+        else:
+            assert Decimal(wire_sum) == expected, (
+                f"{name}: got {wire_sum}, want {expected}"
+            )
