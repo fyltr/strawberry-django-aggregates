@@ -52,7 +52,11 @@ def test_aggregate_query(order_schema):
     data = result.data["orderAggregate"]
     assert data["count"] == 6
     assert Decimal(data["sum"]["total"]) == Decimal("1125.00")
-    assert data["sum"]["quantity"] == 13
+    # ``quantity`` is an IntegerField; SUM emits the ``BigInt`` scalar
+    # which serializes as a JSON string per Stream 2 (v1.0). Clients
+    # parse with ``int()`` / ``BigInt()`` to recover the value.
+    assert data["sum"]["quantity"] == "13"
+    assert int(data["sum"]["quantity"]) == 13
     assert Decimal(data["avg"]["total"]) == Decimal("187.50")
 
 

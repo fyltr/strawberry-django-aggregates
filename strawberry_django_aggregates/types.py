@@ -48,6 +48,29 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Custom scalars
+# ---------------------------------------------------------------------------
+
+# Postgres widens ``SUM(int_col)`` to ``bigint`` (8-byte); the GraphQL
+# 32-bit ``Int`` scalar would silently overflow at 2**31 - 1. We emit a
+# string-encoded ``BigInt`` scalar so JS clients past
+# ``Number.MAX_SAFE_INTEGER`` (2**53) survive end-to-end. Used as the
+# output type for ``SUM`` over integer Django fields. Per SPEC § 5.
+BigInt = strawberry.scalar(
+    int,
+    name="BigInt",
+    description=(
+        "64-bit signed integer encoded as a JSON string on the wire to "
+        "survive JavaScript Number.MAX_SAFE_INTEGER (2**53). Used for "
+        "SUM over IntegerField/SmallIntegerField/PositiveIntegerField/"
+        "PositiveSmallIntegerField, where Postgres widens to bigint."
+    ),
+    serialize=str,
+    parse_value=int,
+)
+
+
+# ---------------------------------------------------------------------------
 # Direction / nulls position enums (no equivalents in strawberry-django).
 # ---------------------------------------------------------------------------
 
@@ -192,7 +215,14 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
         if type(field).__name__ == "FloatField":
             return float
         if type(field).__name__ in _INTEGRAL_TYPES:
-            return int
+            # Integer-field SUM widens to Postgres ``bigint``; the
+            # 32-bit GraphQL ``Int`` would silently overflow above
+            # 2**31 - 1, and JS ``Number`` is unsafe past 2**53. Emit
+            # the custom ``BigInt`` scalar (string on the wire) for
+            # all integer field types — including ``BigIntegerField``
+            # whose natural Python type is also ``int`` but whose SUM
+            # result is unbounded.
+            return BigInt
         return _natural_python_type(field)
     if op is AggregateOp.AVG:
         if type(field).__name__ == "DecimalField":

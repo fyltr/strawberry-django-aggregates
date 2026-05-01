@@ -16,6 +16,9 @@ Public surface:
   bucketing tokens (``date_trunc`` and ``date_part::int`` respectively).
 - :func:`parse_aggregate_order` — parser for ``"<field>:<op>"`` order
   terms; raises on unknown.
+- :data:`BigInt` — string-encoded 64-bit signed integer scalar. Output
+  type for ``SUM`` over integer Django fields (Postgres widens to
+  ``bigint``; the 32-bit GraphQL ``Int`` would silently overflow).
 - Errors: :class:`AggregateError`, :class:`OperatorNotSupportedError`,
   :class:`OrderFieldNotAllowed`, :class:`AggregationAcrossRelationError`.
 
@@ -45,6 +48,7 @@ from strawberry_django_aggregates.ordering import (
     parse_aggregate_order,
 )
 from strawberry_django_aggregates.types import (
+    BigInt,
     make_aggregate_type,
     make_group_by_spec,
     make_grouped_type,
@@ -68,6 +72,8 @@ __all__ = [
     "TimeGranularity",
     "NumberGranularity",
     "default_operators_for",
+    # Custom scalars
+    "BigInt",
     # Ordering
     "parse_aggregate_order",
     "comodel_ordering_terms",

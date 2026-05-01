@@ -175,7 +175,7 @@ Direct mapping to SQL — no operator outside this enum reaches the database:
 |---|---|---|---|
 | `count` | `COUNT(*)` | All | `Int!` |
 | `count_distinct` | `COUNT(DISTINCT col)` | All | `Int!` |
-| `sum` | `SUM(col)` | All | numeric type of `col` |
+| `sum` | `SUM(col)` | All | `BigInt` for integer field types (`IntegerField`, `SmallIntegerField`, `PositiveIntegerField`, `PositiveSmallIntegerField`, `BigIntegerField`); `Decimal` for `DecimalField`; `Float` for `FloatField`; `Duration` for `DurationField` |
 | `avg` | `AVG(col)` | All | `Float` (or `Decimal` for `DecimalField`) |
 | `min` / `max` | `MIN(col)` / `MAX(col)` | All | type of `col` |
 | `stddev` | `STDDEV_SAMP(col)` | **Postgres only** | `Float` |
@@ -184,6 +184,8 @@ Direct mapping to SQL — no operator outside this enum reaches the database:
 | `bool_or` | `BOOL_OR(col)` | Postgres native; SQLite emulated via `MAX(col::int)::bool` | `Boolean` |
 | `array_agg` | `ARRAY_AGG(col ORDER BY <pk>)` | **Postgres only** | `[ID!]` or `[String!]` etc. |
 | `string_agg` | `STRING_AGG(col, ',' ORDER BY <pk>)` | **Postgres only** | `String` |
+
+**`BigInt` for integer-field SUM.** Postgres widens `SUM(int_col)` to 8-byte `bigint`, which overflows the 32-bit GraphQL `Int` scalar (max 2³¹ − 1 ≈ 2.1 billion). Even `bigint`-fitting values escape the JavaScript `Number` safe range past 2⁵³ ≈ 9 × 10¹⁵. We emit a custom `BigInt` scalar that serializes as a JSON string on the wire so JS/TS clients survive end-to-end without precision loss; clients re-parse with `BigInt()` (TS) or `int()` (Python). The same scalar applies whether the underlying field is `IntegerField`, `SmallIntegerField`, `PositiveIntegerField`, `PositiveSmallIntegerField`, or `BigIntegerField`.
 
 **`array_agg` returns IDs only — never auto-hydrated.** Odoo's `recordset` operator browse-resolves to live records and is a serialization landmine in GraphQL (think: 10000 element arrays expanded into nested objects on every group). We refuse the auto-hydration. Clients refetch by ID and Strawberry's `DjangoOptimizerExtension` batches the lookup.
 
