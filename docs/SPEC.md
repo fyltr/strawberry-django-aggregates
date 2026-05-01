@@ -203,6 +203,44 @@ Field types map to default operator allowlists. Consumers can narrow further via
 
 `count` and `count_distinct` are always present at the type level (operate on rows, not on a measure).
 
+### NULL semantics
+
+Standard SQL three-valued-logic applies. Every emitted measure field on
+`<Model>SumFields`, `<Model>AvgFields`, `<Model>MinFields`,
+`<Model>MaxFields`, `<Model>StddevFields`, `<Model>VarianceFields`,
+`<Model>BoolAndFields`, and `<Model>BoolOrFields` is therefore nullable
+(`T | None`) — direct reflection of the SQL outcomes below.
+
+- **`count`** — counts rows in the group. Equivalent to `COUNT(*)`.
+  Implementation uses `COUNT(<pk>)`, which is identical because primary
+  keys are non-null by definition. Never returns NULL; an empty group is
+  simply absent from the result set (no row emitted with `count = 0`
+  unless empty-bucket filling is enabled — see § 7.1 once it lands).
+- **`count_distinct(field)`** — `COUNT(DISTINCT col)`, counting **non-null
+  distinct values**. NULL is not a distinct value and is excluded.
+  Returns `0` for an all-NULL group, never NULL itself. (Multi-column
+  `count_distinct(fields:)` follows the same rule under standard SQL: any
+  tuple containing a NULL is excluded; SQLite emulation may differ — this
+  caveat is restated when Stream 8 lands.)
+- **`sum`, `avg`, `min`, `max`, `stddev`, `variance`, `stddev_pop`,
+  `var_pop`** — skip NULL inputs. An empty group, or a group whose
+  measure column is entirely NULL, returns NULL. **`sum` does NOT default
+  to 0** for an all-NULL group; callers wanting `0` must coalesce
+  client-side or pre-aggregate with `Coalesce(F('total'), 0)` before
+  passing the queryset in.
+- **`bool_and` / `bool_or`** — skip NULL inputs. An all-NULL group
+  returns NULL, not `True`/`False`. Mixed-NULL groups behave per SQL: a
+  single `FALSE` short-circuits `bool_and` to `FALSE` regardless of
+  NULLs; a single `TRUE` short-circuits `bool_or` to `TRUE`.
+- **`array_agg` / `string_agg`** — **include NULLs by default in
+  PostgreSQL** (`ARRAY_AGG(col)` produces an array containing NULL
+  entries; `STRING_AGG(col, ',')` skips NULLs but the surrounding rows
+  are unaffected). This is a known footgun — callers wanting non-null
+  values only should pre-filter the queryset
+  (`qs.exclude(<field>__isnull=True)`). The library does not currently
+  emit `FILTER (WHERE col IS NOT NULL)` clauses; this is documented
+  behavior, not a bug.
+
 ## 6 · Group-by spec
 
 The wire format is the typed input object — no Odoo-style `field:granularity` strings:

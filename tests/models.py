@@ -30,7 +30,9 @@ class Order(models.Model):
         Customer, on_delete=models.CASCADE, related_name="orders",
     )
     status      = models.CharField(max_length=16, choices=STATUS_CHOICES)
-    total       = models.DecimalField(max_digits=10, decimal_places=2)
+    total       = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True,
+    )
     quantity    = models.IntegerField(default=1)
     is_priority = models.BooleanField(default=False)
     created_at  = models.DateTimeField()
