@@ -1,6 +1,6 @@
 [project]
 name            = "strawberry-django-aggregates"
-version         = "0.1.0"
+version         = "1.0.0"
 description     = "Hasura-shape aggregations over Django querysets in Strawberry GraphQL — count, sum, avg, min, max, stddev, variance, array_agg + Odoo-grade group-by with timezone-correct date bucketing."
 readme          = "README.md"
 requires-python = ">=3.13"
@@ -11,7 +11,7 @@ keywords        = [
   "hasura", "postgraphile", "odoo", "analytics",
 ]
 classifiers     = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Framework :: Django",
   "Framework :: Django :: 5.0",
   "Framework :: Django :: 5.1",
