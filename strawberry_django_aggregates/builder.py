@@ -115,6 +115,7 @@ class AggregateBuilder:
     name_prefix:      str | None = None
     filter_type:      type | None = None
     get_queryset:     Callable[[Any], QuerySet] | None = None
+    respect_comodel_ordering: bool = False
 
     def build(self) -> BuiltAggregates:
         """Generate all types and return them along with attached fields."""
@@ -271,6 +272,7 @@ class AggregateBuilder:
                 order_by=order_terms,
                 offset=offset,
                 limit=limit,
+                respect_comodel_ordering=builder.respect_comodel_ordering,
             )
             total = builder._count_groups(
                 qs, spec, requested, having_dict,

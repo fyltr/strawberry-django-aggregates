@@ -20,7 +20,7 @@ GraphQL imports. Pure string parsing + namespace lookup.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from strawberry_django_aggregates.errors import OrderFieldNotAllowed
 from strawberry_django_aggregates.operators import AggregateOp
@@ -149,3 +149,94 @@ def aggregate_aliases_from_spec(
         op_enum = op if isinstance(op, AggregateOp) else AggregateOp(op)
         aliases.append(aggregate_alias(op_enum, field_path))
     return aliases
+
+
+def comodel_ordering_terms(
+    model: type[Any],
+    fk_alias: str,
+) -> list[str]:
+    """Return additional ORDER BY tokens implied by a comodel's
+    ``Meta.ordering``, given an FK alias on the parent model.
+
+    Mirrors Odoo ``BaseModel._order_field_to_sql`` (``odoo/models.py:
+    2253``): when the user orders by an FK column, append the
+    comodel's intrinsic order so result rows come out alphabetically
+    (or whatever the comodel decided) rather than in raw FK-ID order.
+
+    Example
+    -------
+    ``model=Order``, ``fk_alias="customer_id"`` → if ``Customer`` has
+    ``Meta.ordering = ['name']``, returns ``["customer__name"]``.
+    Reverse-direction terms (``"-name"``) are preserved.
+
+    Returns an empty list when:
+
+    - ``fk_alias`` does not resolve to a many-to-one field on
+      ``model`` (caller passed a non-FK group-by alias),
+    - the comodel has no ``Meta.ordering`` (or it's empty),
+    - the comodel's ordering refers to a relation it can't traverse
+      from the parent (defensive — would surface as an
+      ``OrderFieldNotAllowed`` at queryset compile time anyway).
+
+    The added terms are guaranteed-valid by construction: the comodel
+    asserts they resolve in its own ``Meta``. Strict-allowlist
+    enforcement (Critical Rule 6) still applies to user-supplied
+    terms; this helper only produces tiebreakers.
+    """
+    fk_field = _resolve_fk_field(model, fk_alias)
+    if fk_field is None:
+        return []
+    comodel = getattr(fk_field, "related_model", None)
+    if comodel is None:
+        return []
+    ordering = tuple(getattr(comodel._meta, "ordering", ()) or ())
+    if not ordering:
+        return []
+    fk_name = fk_field.name
+    out: list[str] = []
+    for term in ordering:
+        if not isinstance(term, str) or not term:
+            continue
+        # ``Meta.ordering`` allows expressions (``F``, ``OrderBy``);
+        # we only translate plain string terms. Anything else gets
+        # skipped — the comodel's intrinsic ordering is best-effort
+        # tiebreaker, never load-bearing for correctness.
+        if term.startswith("-"):
+            out.append(f"-{fk_name}__{term[1:]}")
+        else:
+            out.append(f"{fk_name}__{term}")
+    return out
+
+
+def _resolve_fk_field(model: type[Any], fk_alias: str) -> Any:
+    """Resolve a group-by FK alias (``"customer_id"``) back to the
+    underlying many-to-one field on ``model``. Returns ``None`` if no
+    such FK exists.
+
+    Tries two strategies in order: lookup by ``attname`` (the actual
+    column name Django emits, e.g. ``customer_id``) and lookup by the
+    alias minus a trailing ``_id``. Both are needed because
+    :func:`compiler.group_by_alias` appends ``_id`` to FK names but
+    Django's ``get_field`` accepts the bare FK name too.
+    """
+    meta = getattr(model, "_meta", None)
+    if meta is None:
+        return None
+    # Strategy 1: walk concrete fields and match by attname.
+    for field in meta.get_fields():
+        if not getattr(field, "many_to_one", False):
+            continue
+        if getattr(field, "attname", None) == fk_alias:
+            return field
+        if getattr(field, "name", None) == fk_alias:
+            return field
+    # Strategy 2: strip a trailing "_id" and try get_field by name.
+    if fk_alias.endswith("_id"):
+        bare = fk_alias[: -len("_id")]
+        try:
+            field = meta.get_field(bare)
+        except Exception:
+            return None
+        if getattr(field, "many_to_one", False):
+            return field
+    return None

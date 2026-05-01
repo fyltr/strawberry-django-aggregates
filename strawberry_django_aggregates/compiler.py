@@ -156,11 +156,18 @@ def compute_aggregation(
     offset:     int = 0,
     limit:      int | None = None,
     tz:         str | None = None,
+    respect_comodel_ordering: bool = False,
 ) -> list[dict[str, Any]]:
     """Compile a queryset into an aggregation query.
 
     See ``docs/SPEC.md`` § 10 for the full contract. Permission-naive —
     the queryset must already be scoped by the caller.
+
+    When ``respect_comodel_ordering`` is ``True``, ordering by an FK
+    group-by alias (e.g. ``customer_id``) appends the comodel's
+    ``Meta.ordering`` as additional ORDER BY tiebreakers. Mirrors Odoo
+    ``_order_field_to_sql`` (``odoo/models.py:2253``). Off by default
+    so the determinism contract for existing callers is unchanged.
     """
     group_by    = group_by    or []
     aggregates  = aggregates  or []
@@ -191,7 +198,11 @@ def compute_aggregation(
     having_q = _build_having_q(having, aggregate_annotations.keys())
 
     order_terms = _build_order_terms(
-        order_by, group_aliases, list(aggregate_annotations.keys()),
+        order_by,
+        group_aliases,
+        list(aggregate_annotations.keys()),
+        model=model,
+        respect_comodel_ordering=respect_comodel_ordering,
     )
 
     qs = queryset
@@ -542,14 +553,31 @@ def _build_order_terms(
     order_by: list[tuple[str, str, str | None]],
     group_aliases: list[str],
     aggregate_aliases: list[str],
+    *,
+    model: type | None = None,
+    respect_comodel_ordering: bool = False,
 ) -> list[Any]:
     """Translate ``[(alias, direction, nulls)]`` into queryset-ready
     expressions, validating each alias against the group_by + aggregate
     namespaces. Raises :class:`OrderFieldNotAllowed` on miss.
+
+    When ``respect_comodel_ordering`` is ``True`` and ``model`` is
+    given, terms resolving to a group-by FK alias (``customer_id``)
+    are followed by the comodel's intrinsic ``Meta.ordering`` as
+    tiebreakers. The added terms are always-valid by construction
+    (they come from the comodel's own meta) so they bypass the
+    user-facing allowlist check.
     """
     if not order_by:
         return []
+    # Local import — ordering.py already imports from compiler at
+    # call time via aggregate_aliases_from_spec; keep the dependency
+    # one-way at module load.
+    from strawberry_django_aggregates.ordering import (
+        comodel_ordering_terms,
+    )
     valid = set(group_aliases) | set(aggregate_aliases)
+    group_alias_set = set(group_aliases)
     terms: list[Any] = []
     for alias, direction, nulls in order_by:
         if alias not in valid:
@@ -569,4 +597,23 @@ def _build_order_terms(
             terms.append(expr.asc(
                 nulls_first=nulls_first, nulls_last=nulls_last,
             ))
+        if (
+            respect_comodel_ordering
+            and model is not None
+            and alias in group_alias_set
+        ):
+            for extra in comodel_ordering_terms(model, alias):
+                terms.append(_term_to_expression(extra))
     return terms
+
+
+def _term_to_expression(term: str) -> Any:
+    """Translate ``"customer__name"`` / ``"-customer__rating"`` into
+    a Django ``F().asc()`` / ``F().desc()`` expression.
+
+    Used for comodel-derived ordering tiebreakers — these terms are
+    always plain ``Meta.ordering`` strings, never user input.
+    """
+    if term.startswith("-"):
+        return F(term[1:]).desc()
+    return F(term).asc()

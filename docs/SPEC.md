@@ -307,6 +307,37 @@ Unknown values raise `OrderFieldNotAllowed` at validation time. **Fail-loud is t
 
 The parser is in `ordering.py::parse_aggregate_order`.
 
+### 9.1 · Comodel-derived tiebreakers (opt-in)
+
+When the user orders by a foreign-key group-by alias (`customer_id`), the
+default behaviour is to ORDER BY that integer column directly — rows come out
+in raw FK-ID order, which surprises consumers who expect alphabetical customer
+listings. Setting `respect_comodel_ordering=True` on `compute_aggregation` (or
+on `AggregateBuilder`) walks to the comodel and appends its `Meta.ordering` as
+additional ORDER BY tiebreakers. Mirrors Odoo `_order_field_to_sql`
+(`odoo/models.py:2253`).
+
+```python
+class Customer(models.Model):
+    name = models.CharField(max_length=100)
+    class Meta:
+        ordering = ["name"]
+
+# order_by [("customer_id", "asc", None)] with the flag set emits:
+#   ORDER BY orders.customer_id ASC, customers.name ASC
+```
+
+The flag is **opt-in** to keep determinism for the existing test corpus and
+to avoid surprising consumers with implicit JOINs they didn't ask for. The
+appended terms are always-valid by construction (they come from the comodel's
+own `Meta`) and bypass the user-facing fail-loud check — Critical Rule 6 is
+unaffected because the strict allowlist still applies to the user's primary
+order term.
+
+When the comodel has no `Meta.ordering`, the flag is a no-op. Non-string
+ordering entries (`F` expressions, `OrderBy` objects) are skipped — the
+intrinsic ordering is a best-effort tiebreaker, never load-bearing.
+
 ## 10 · The backend primitive — `compute_aggregation`
 
 ```python

@@ -17,6 +17,11 @@ class Customer(models.Model):
 
     class Meta:
         app_label = "tests"
+        # Intrinsic ordering exercised by Stream 16's
+        # ``respect_comodel_ordering`` flag. Other tests remain
+        # robust to row order — they look rows up by FK id, not by
+        # iteration order — so this addition is safe.
+        ordering = ["name"]
 
 
 class Order(models.Model):

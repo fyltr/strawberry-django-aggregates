@@ -40,7 +40,10 @@ from strawberry_django_aggregates.operators import (
     AggregateOp,
     default_operators_for,
 )
-from strawberry_django_aggregates.ordering import parse_aggregate_order
+from strawberry_django_aggregates.ordering import (
+    comodel_ordering_terms,
+    parse_aggregate_order,
+)
 from strawberry_django_aggregates.types import (
     make_aggregate_type,
     make_group_by_spec,
@@ -67,6 +70,7 @@ __all__ = [
     "default_operators_for",
     # Ordering
     "parse_aggregate_order",
+    "comodel_ordering_terms",
     # Errors
     "AggregateError",
     "OperatorNotSupportedError",
