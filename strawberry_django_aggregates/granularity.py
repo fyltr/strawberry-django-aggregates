@@ -69,3 +69,28 @@ NUMBER_GRANULARITY_PART: dict[NumberGranularity, str] = {
 
 Granularity = TimeGranularity | NumberGranularity
 """Either kind of granularity — used in spec inputs."""
+
+
+def validate_week_start(value: int) -> int:
+    """Validate a locale-aware ``week_start`` parameter.
+
+    1 = Monday … 7 = Sunday (ISO 8601 day-of-week numbering). Mirrors
+    Odoo's locale-aware ``week_start`` behaviour
+    (``odoo/models.py:2142-2168``) — different countries / locales pin
+    the first day of the week differently (US/Canada/Japan: Sunday;
+    most of EU: Monday; Iran/Saudi: Saturday). The library's default
+    is 1 (Monday / ISO) so existing callers see no behaviour change.
+
+    Raises ``ValueError`` for non-int input or values outside [1, 7].
+    """
+    # ``bool`` is a subclass of ``int``; reject explicitly so a stray
+    # ``True`` / ``False`` doesn't silently pass as 1 / 0.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"week_start must be int in [1, 7]; got {value!r}",
+        )
+    if not 1 <= value <= 7:
+        raise ValueError(
+            f"week_start must be int in [1, 7]; got {value!r}",
+        )
+    return value

@@ -29,6 +29,7 @@ from django.db.models import (
     Count,
     DateField,
     DateTimeField,
+    ExpressionWrapper,
     F,
     FloatField,
     Func,
@@ -58,6 +59,7 @@ from strawberry_django_aggregates.granularity import (
     Granularity,
     NumberGranularity,
     TimeGranularity,
+    validate_week_start,
 )
 from strawberry_django_aggregates.operators import AggregateOp
 
@@ -145,6 +147,7 @@ def _add_months(value: datetime.datetime, months: int) -> datetime.datetime:
 def bucket_range(
     value: datetime.datetime,
     granularity: TimeGranularity,
+    week_start: int = 1,
 ) -> tuple[datetime.datetime, datetime.datetime]:
     """Compute the half-open ``[from, to)`` interval for a bucketed
     datetime ``value`` at the given ``granularity``.
@@ -154,15 +157,26 @@ def bucket_range(
     ``from_`` is returned as ``value`` unchanged; ``to`` is the start
     of the next bucket. Both share the same ``tzinfo``.
 
+    For ``WEEK``, the SQL truncation already accounts for the user-
+    supplied ``week_start`` (1=Mon…7=Sun, ISO default), so the input
+    ``value`` is already the start of the user's week. The interval
+    is therefore always +7 days regardless of ``week_start``; the
+    parameter is accepted for symmetry with the resolver call site
+    and is validated for fail-loud feedback when callers pass a bad
+    value to the helper directly.
+
     Examples (all in the value's tzinfo):
 
     - ``bucket_range(2026-05-01 00:00, MONTH)`` →
       ``(2026-05-01 00:00, 2026-06-01 00:00)``
     - ``bucket_range(2026-05-04 00:00, WEEK)`` (Mon-start) →
       ``(2026-05-04 00:00, 2026-05-11 00:00)``
+    - ``bucket_range(2026-05-03 00:00, WEEK, week_start=7)`` (Sun) →
+      ``(2026-05-03 00:00, 2026-05-10 00:00)``
     - ``bucket_range(2026-05-01 14:00, HOUR)`` →
       ``(2026-05-01 14:00, 2026-05-01 15:00)``
     """
+    validate_week_start(week_start)
     if granularity is TimeGranularity.YEAR:
         return value, _add_months(value, 12)
     if granularity is TimeGranularity.QUARTER:
@@ -341,6 +355,7 @@ def compute_aggregation(
     offset:     int = 0,
     limit:      int | None = None,
     tz:         str | None = None,
+    week_start: int = 1,
     respect_comodel_ordering: bool = False,
     op_args:    dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -354,6 +369,12 @@ def compute_aggregation(
     ``Meta.ordering`` as additional ORDER BY tiebreakers. Mirrors Odoo
     ``_order_field_to_sql`` (``odoo/models.py:2253``). Off by default
     so the determinism contract for existing callers is unchanged.
+
+    ``week_start`` selects the locale-aware first day of the week for
+    ``TimeGranularity.WEEK`` bucketing and ``NumberGranularity.DAY_OF_WEEK``
+    extraction. ``1=Monday`` (ISO default) … ``7=Sunday``. Mirrors Odoo
+    ``odoo/models.py:2142-2168``. Out-of-range values raise ``ValueError``
+    at the top of the function.
 
     ``op_args`` is the parallel-dict channel for per-call operator
     arguments that don't fit the ``(op, field)`` 2-tuple shape — chiefly
@@ -373,6 +394,7 @@ def compute_aggregation(
     model       = queryset.model
     tz_name     = tz or settings.TIME_ZONE
     tzinfo      = _resolve_tzinfo(tz_name)
+    week_start  = validate_week_start(week_start)
 
     if having and not group_by:
         raise AggregateError(
@@ -384,7 +406,7 @@ def compute_aggregation(
     _validate_postgres_only(aggregates, vendor)
 
     group_annotations, group_aliases = _build_group_by_annotations(
-        model, group_by, tzinfo,
+        model, group_by, tzinfo, week_start,
     )
 
     aggregate_annotations = _build_aggregate_annotations(
@@ -494,6 +516,7 @@ def _build_group_by_annotations(
     model: type,
     group_by: list[tuple[str, Granularity | None]],
     tzinfo: ZoneInfo,
+    week_start: int = 1,
 ) -> tuple[dict[str, Any], list[str]]:
     """Build the ``.annotate()`` kwargs that materialize each group_by
     spec, plus the canonical alias list to feed into ``.values()``.
@@ -517,7 +540,7 @@ def _build_group_by_annotations(
         alias = group_by_alias(field_path, granularity, field)
         if granularity is not None:
             annotations[alias] = _build_group_by_expression(
-                field_path, granularity, field, tzinfo,
+                field_path, granularity, field, tzinfo, week_start,
             )
         aliases.append(alias)
 
@@ -550,6 +573,7 @@ def _build_group_by_expression(
     granularity: Granularity | None,
     field: Field,
     tzinfo: ZoneInfo,
+    week_start: int = 1,
 ) -> Any:
     """Build the Django expression for a group_by spec.
 
@@ -557,6 +581,12 @@ def _build_group_by_expression(
     we emit ``Trunc`` / ``Extract`` with ``tzinfo=`` so Django's backend
     inserts the ``AT TIME ZONE`` wrap *before* truncation
     (postgres/operations.py:135–138; mirrors Odoo's wrap order).
+
+    ``week_start`` (1=Mon…7=Sun) shifts the WEEK-bucket boundary and
+    rotates the DAY_OF_WEEK numeric extraction so the user-supplied
+    first day of week is encoded as ``1``. Mirrors Odoo
+    ``odoo/models.py:2142-2168``. Default ``1`` is ISO (Mon) and emits
+    the same SQL as before this stream — no behaviour change.
     """
     if granularity is None:
         return F(field_path)
@@ -574,15 +604,88 @@ def _build_group_by_expression(
     tz_kw: dict[str, Any] = {"tzinfo": tzinfo} if is_dt else {}
 
     if isinstance(granularity, TimeGranularity):
+        if granularity is TimeGranularity.WEEK:
+            return _trunc_week_shifted(
+                field_path, field, tz_kw, week_start,
+            )
         return Trunc(field_path, granularity.value, **tz_kw)
 
     if isinstance(granularity, NumberGranularity):
         if granularity is NumberGranularity.DAY_OF_YEAR:
             return _ExtractDayOfYear(field_path, **tz_kw)
+        if granularity is NumberGranularity.DAY_OF_WEEK:
+            return _extract_day_of_week_rotated(
+                field_path, tz_kw, week_start,
+            )
         return Extract(field_path, _NUMBER_LOOKUP[granularity], **tz_kw)
 
     raise GranularityNotApplicable(  # defensive
         f"Unknown granularity {granularity!r}."
+    )
+
+
+def _trunc_week_shifted(
+    field_path: str,
+    field: Field,
+    tz_kw: dict[str, Any],
+    week_start: int,
+) -> Any:
+    """Emit a Trunc('week') that respects ``week_start``.
+
+    Shift the source by ``offset = (8 - week_start) % 7`` days, run
+    ``Trunc('week')`` (which is Monday-start on both PG and SQLite),
+    then shift back by the same offset. When ``offset == 0`` (the ISO
+    Monday default) we skip the arithmetic entirely so the determinism
+    contract for existing callers is preserved — same SQL as before
+    this stream.
+
+    Date fields (no time component) need an ``output_field`` hint on
+    the ``ExpressionWrapper`` so Django picks the right SQL shape.
+    """
+    offset = (8 - week_start) % 7
+    if offset == 0:
+        return Trunc(field_path, "week", **tz_kw)
+
+    delta = datetime.timedelta(days=offset)
+    out_field: Any = (
+        DateTimeField() if isinstance(field, DateTimeField) else DateField()
+    )
+    shifted_in = ExpressionWrapper(
+        F(field_path) + delta, output_field=out_field,
+    )
+    truncated = Trunc(shifted_in, "week", **tz_kw)
+    return ExpressionWrapper(
+        truncated - delta, output_field=out_field,
+    )
+
+
+def _extract_day_of_week_rotated(
+    field_path: str,
+    tz_kw: dict[str, Any],
+    week_start: int,
+) -> Any:
+    """Emit a DAY_OF_WEEK extraction rotated by ``week_start``.
+
+    ISO ``iso_week_day`` returns 1=Mon..7=Sun. Rotate so that the
+    user's ``week_start`` is encoded as ``1``:
+
+        ((iso_dow - week_start) % 7) + 1
+
+    For ``week_start == 1`` the rotation is a no-op
+    (``((d - 1) % 7) + 1 == d``) — skip the arithmetic so the SQL is
+    identical to the pre-stream-6 ISO emission.
+    """
+    base = Extract(field_path, "iso_week_day", **tz_kw)
+    if week_start == 1:
+        return base
+    # ``%`` in Django expressions follows Python semantics on PG
+    # (where MOD is non-negative for positive divisors) — `iso_dow`
+    # is in [1, 7] and `week_start` in [1, 7] so the subtraction is
+    # in [-6, 6]; we add `+ 7` before the modulo to avoid relying on
+    # any vendor's interpretation of negative modulo.
+    return ExpressionWrapper(
+        ((base - Value(week_start) + Value(7)) % Value(7)) + Value(1),
+        output_field=IntegerField(),
     )
 
 
