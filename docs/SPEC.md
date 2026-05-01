@@ -487,7 +487,7 @@ NUMBER granularity (`DAY_OF_WEEK`, `MONTH_NUMBER`, etc.) is degenerate
 — there is no contiguous range for "all Tuesdays" — and gets no range
 sibling.
 
-#### `bucket_range(value, granularity)` — backend primitive
+#### `bucket_range(value, granularity, week_start=1)` — backend primitive
 
 The same arithmetic is exposed as a public helper for callers outside
 the GraphQL resolver:
@@ -503,6 +503,72 @@ Pure stdlib, no Django / Strawberry imports — callable from any Python
 context (DRF view, Celery task, MCP tool, plain `manage.py shell`).
 Lives in `compiler.py` to honour CLAUDE.md Critical Rule 9 (no GraphQL
 coupling on the framework-agnostic primitives).
+
+The optional `week_start` parameter (1=Mon…7=Sun, ISO default) is
+accepted for symmetry with `compute_aggregation` and is validated
+fail-loud. The `value` passed in is already the truncated bucket
+boundary in the user's chosen first-day-of-week (the SQL truncation
+uses the same `week_start`), so the returned interval is always +7
+days for `WEEK` regardless of the parameter — the helper just needs
+the value for validation feedback.
+
+### 7.1 · Locale-aware week start
+
+`compute_aggregation(..., week_start=N)` selects the first day of the
+week for `TimeGranularity.WEEK` bucketing and `NumberGranularity.DAY_OF_WEEK`
+extraction. `1=Monday` (ISO 8601 default) … `7=Sunday`. Mirrors Odoo
+`odoo/models.py:2142-2168` — different countries pin the first day of
+the week differently (US/Canada/Japan: Sunday; most of EU: Monday;
+Iran/Saudi Arabia: Saturday) and analytics queries that group by week
+need to honour the consumer's choice without forcing them to compute
+shifted bucket boundaries client-side.
+
+**WEEK bucketing.** PostgreSQL's `date_trunc('week', ts)` and Django's
+`Trunc('week')` both return the Monday-start week. To shift to a
+different first day, the library applies an offset of
+`offset = (8 - week_start) % 7` days:
+
+```sql
+-- week_start=7 (Sunday-start), offset=1
+date_trunc('week', col + INTERVAL '1 day') - INTERVAL '1 day'
+```
+
+When `week_start == 1` (offset 0) the shift is skipped entirely — the
+emitted SQL is identical to the pre-`week_start` behaviour, so the
+determinism contract for existing callers is preserved. SQLite uses
+the same arithmetic via `ExpressionWrapper(F(col) + timedelta(...))`.
+
+**DAY_OF_WEEK rotation.** ISO `EXTRACT(ISODOW FROM col)` returns
+1=Monday..7=Sunday. With `week_start=N` the numeric encoding rotates
+so the user's first day is `1`:
+
+```python
+((iso_dow - week_start) % 7) + 1
+```
+
+When `week_start == 1` the rotation is a no-op (skipped, same SQL as
+before). For `week_start=7` (Sunday-first), Sunday returns `1`, Monday
+`2`, …, Saturday `7`.
+
+**GraphQL surface.** The grouped field accepts `weekStart: Int` (default
+omitted; compiler default of 1 / ISO Monday applies). The argument is
+emitted unconditionally on every grouped resolver — no flag — so the
+SDL is stable. Out-of-range values (`< 1`, `> 7`, non-int) raise
+`ValueError` at resolver entry, before any SQL fires.
+
+```graphql
+ordersGroupBy(
+  groupBy: [{ field: CREATED_AT, granularity: WEEK }],
+  weekStart: 7
+) { results { key { createdAtWeek } count } }
+```
+
+**`bucket_range` interaction.** With `week_start=N` the SQL truncation
+already returns the user's first-day-of-week as the bucket boundary,
+so the resolver passes that same value plus `week_start` to
+`bucket_range` for symmetry — the helper still adds 7 days, but the
+parameter is validated for fail-loud feedback when callers use the
+helper directly.
 
 ### Timezone correctness
 

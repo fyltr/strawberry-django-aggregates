@@ -44,6 +44,7 @@ from strawberry_django_aggregates.errors import (
 from strawberry_django_aggregates.granularity import (
     NumberGranularity,
     TimeGranularity,
+    validate_week_start,
 )
 from strawberry_django_aggregates.operators import (
     AggregateOp,
@@ -78,6 +79,7 @@ __all__ = [
     "AggregateOp",
     "TimeGranularity",
     "NumberGranularity",
+    "validate_week_start",
     "default_operators_for",
     # Custom scalars
     "BigInt",

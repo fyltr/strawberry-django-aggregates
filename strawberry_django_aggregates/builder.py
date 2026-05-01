@@ -270,6 +270,7 @@ class AggregateBuilder:
             having:    Any = None,
             order_by:  Any = None,
             pagination: OffsetPaginationInput | None = None,
+            week_start: int = 1,
         ) -> Any:
             qs = builder._resolve_queryset(info)
             if filter is not None:
@@ -291,6 +292,10 @@ class AggregateBuilder:
             ) else None
             offset = pagination.offset or 0
 
+            # Locale-aware week-start. Validate at the resolver
+            # boundary so a bad value fails fast before any SQL.
+            ws = builder._resolve_week_start(week_start)
+
             rows = compute_aggregation(
                 qs,
                 group_by=spec,
@@ -301,14 +306,17 @@ class AggregateBuilder:
                 limit=limit,
                 respect_comodel_ordering=builder.respect_comodel_ordering,
                 op_args=op_args,
+                week_start=ws,
             )
             total = builder._count_groups(
                 qs, spec, requested, having_dict, op_args=op_args,
+                week_start=ws,
             )
             grouped_rows = [
                 builder._shape_grouped(
                     grouped_type, group_key_type, row, requested, spec,
                     op_args=op_args,
+                    week_start=ws,
                 )
                 for row in rows
             ]
@@ -331,6 +339,7 @@ class AggregateBuilder:
             list[group_order_input] | None  # type: ignore[valid-type]
         )
         annotations["pagination"] = OffsetPaginationInput | None
+        annotations["week_start"] = int
         annotations["return"]     = grouped_result_type
 
         if filter_type is None:
@@ -341,11 +350,12 @@ class AggregateBuilder:
                 having:    Any = None,
                 order_by:  Any = None,
                 pagination: OffsetPaginationInput | None = None,
+                week_start: int = 1,
             ) -> Any:
                 return resolver(
                     info=info, group_by=group_by, filter=None,
                     having=having, order_by=order_by,
-                    pagination=pagination,
+                    pagination=pagination, week_start=week_start,
                 )
             resolver_no_filter.__annotations__ = annotations
             return strawberry_django.field(
@@ -357,6 +367,20 @@ class AggregateBuilder:
         return strawberry_django.field(
             resolver=resolver, disable_optimization=True,
         )
+
+    @staticmethod
+    def _resolve_week_start(value: Any) -> int:
+        """Validate the resolver-arg ``week_start`` (1=Mon..7=Sun).
+
+        Goes through :func:`granularity.validate_week_start` so out-
+        of-range or non-int values raise ``ValueError`` before any
+        SQL fires. The GraphQL default is ``1`` (ISO Monday) — same
+        behaviour as before this stream.
+        """
+        from strawberry_django_aggregates.granularity import (
+            validate_week_start,
+        )
+        return validate_week_start(value)
 
     # ------- helpers (queryset / shaping / translation) -------------------
 
@@ -682,6 +706,7 @@ class AggregateBuilder:
         requested: list[tuple[AggregateOp, str | None]],
         having_dict: dict[str, Any],
         op_args: dict[str, dict[str, Any]] | None = None,
+        week_start: int = 1,
     ) -> int:
         """Total distinct group buckets matching the request, ignoring
         offset/limit.
@@ -695,6 +720,11 @@ class AggregateBuilder:
         Either way: no Python-side row materialization. The previous
         version called :func:`compute_aggregation` and ``len()``-ed
         the list, which fetched every group row.
+
+        ``week_start`` mirrors ``compute_aggregation`` so the COUNT
+        groups by the same WEEK / DAY_OF_WEEK boundaries the data
+        query uses. Counting with a different ``week_start`` would
+        report a different bucket cardinality than the page returns.
         """
         from django.conf import settings
         from django.db import connections
@@ -712,7 +742,7 @@ class AggregateBuilder:
         vendor = connections[qs.db].vendor
         tzinfo = _resolve_tzinfo(settings.TIME_ZONE)
         group_ann, group_aliases = _build_group_by_annotations(
-            qs.model, spec, tzinfo,
+            qs.model, spec, tzinfo, week_start,
         )
 
         if not having_dict:
@@ -768,6 +798,7 @@ class AggregateBuilder:
         requested: list[tuple[AggregateOp, str | None]],
         spec: list[tuple[str, Any]],
         op_args: dict[str, dict[str, Any]] | None = None,
+        week_start: int = 1,
     ) -> Any:
         key_kwargs: dict[str, Any] = {}
         for fp, grain in spec:
@@ -784,7 +815,7 @@ class AggregateBuilder:
             # None if the row had a NULL for the underlying date — in
             # that case the range stays None too.
             if isinstance(grain, TimeGranularity) and value is not None:
-                from_, to = bucket_range(value, grain)
+                from_, to = bucket_range(value, grain, week_start)
                 key_kwargs[f"{alias}_range"] = BucketRange(
                     from_=from_, to=to,
                 )
