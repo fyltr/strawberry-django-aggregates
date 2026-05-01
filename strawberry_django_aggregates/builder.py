@@ -32,6 +32,7 @@ from strawberry_django.pagination import (
 
 from strawberry_django_aggregates.compiler import (
     HAVING_COMPARISONS,
+    bucket_range,
     compute_aggregation,
     group_by_alias,
 )
@@ -48,6 +49,7 @@ from strawberry_django_aggregates.ordering import (
     parse_aggregate_order,
 )
 from strawberry_django_aggregates.types import (
+    BucketRange,
     make_aggregate_type,
     make_group_by_spec,
     make_group_order_input,
@@ -773,7 +775,19 @@ class AggregateBuilder:
             alias = group_by_alias(
                 fp, grain, field,  # type: ignore[arg-type]
             )
-            key_kwargs[alias] = row.get(alias)
+            value = row.get(alias)
+            key_kwargs[alias] = value
+            # TIME granularity: emit the half-open ``[from, to)``
+            # interval as a sibling ``<alias>_range: BucketRange`` per
+            # SPEC § 7 (Stream 5). NUMBER granularity has no
+            # contiguous range and gets no sibling. ``value`` may be
+            # None if the row had a NULL for the underlying date — in
+            # that case the range stays None too.
+            if isinstance(grain, TimeGranularity) and value is not None:
+                from_, to = bucket_range(value, grain)
+                key_kwargs[f"{alias}_range"] = BucketRange(
+                    from_=from_, to=to,
+                )
         key = group_key_type(**key_kwargs)
 
         kwargs: dict[str, Any] = {

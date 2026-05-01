@@ -72,6 +72,27 @@ BigInt = strawberry.scalar(
 
 
 # ---------------------------------------------------------------------------
+# BucketRange — half-open [from, to) interval for a TIME-bucketed
+# group key. Emitted as a sibling field on ``<Model>GroupKey`` per SPEC
+# § 7. NUMBER granularity (DAY_OF_WEEK etc.) gets no range — there is
+# no contiguous interval for "all Tuesdays."
+# ---------------------------------------------------------------------------
+
+@strawberry.type
+class BucketRange:
+    """Half-open ``[from, to)`` interval for a bucketed date group key.
+
+    ``from_`` is inclusive, ``to`` is exclusive. The Python attribute
+    is ``from_`` because ``from`` is a reserved Python keyword; on the
+    GraphQL wire the field is named ``from`` via
+    ``strawberry.field(name="from")``.
+    """
+
+    from_: datetime.datetime = strawberry.field(name="from")
+    to:    datetime.datetime
+
+
+# ---------------------------------------------------------------------------
 # Federation v2 helpers (SPEC § 18).
 # ---------------------------------------------------------------------------
 #
@@ -763,11 +784,21 @@ def _emit_group_key(
 
         # Date/datetime fields: emit per-granularity bucket aliases
         # so the resolver can populate whichever the user requested.
+        # Each TIME-granularity bucket also gets a sibling
+        # ``<field>_<grain>_range: BucketRange`` half-open interval per
+        # SPEC § 7 (Stream 5). NUMBER granularity (DAY_OF_WEEK etc.) is
+        # degenerate — no contiguous interval — and gets no range
+        # sibling.
         if type(field).__name__ in {"DateField", "DateTimeField"}:
             for time_grain in TimeGranularity:
                 key_fields.append((
                     f"{field_name}_{time_grain.value}",
                     (datetime.datetime | None),
+                    None,
+                ))
+                key_fields.append((
+                    f"{field_name}_{time_grain.value}_range",
+                    (BucketRange | None),
                     None,
                 ))
             for num_grain in NumberGranularity:
