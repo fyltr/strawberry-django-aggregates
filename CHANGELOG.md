@@ -1,14 +1,15 @@
 # Changelog
 
 All notable changes to `strawberry-django-aggregates` are documented here.
-The project follows [Semantic Versioning](https://semver.org/) starting at
-v1.0.0; see `docs/SPEC.md` § 16 for the SemVer surface.
+The project follows [Semantic Versioning](https://semver.org/). During the
+`0.x` line, minor releases may include controlled breaking changes; see
+`docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
-## [1.0.0] — 2026-05-01
+## [0.2.1] — 2026-05-01
 
-The first stable release. v1.0 closes the gap analysis vs Odoo 18 / Hasura /
-PostGraphile, brings every former v1 non-goal into scope, and ships a stable
-operator vocabulary, granularity track, and SDL emission contract.
+The beta line closing the gap analysis vs Odoo 18 / Hasura / PostGraphile,
+bringing every former non-goal into scope, and stabilising the operator
+vocabulary, granularity track, and SDL emission contract for early adopters.
 
 ### Added
 
@@ -87,7 +88,7 @@ operator vocabulary, granularity track, and SDL emission contract.
 - **CLAUDE.md Critical Rule 4** amended to reference the new
   `allow_relation_traversal` opt-in.
 
-### Out of scope for v1.0 (deferred)
+### Out of scope for 0.2.x (deferred to 1.x)
 
 - **Window functions** (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, running
   aggregates) — v1.1.
