@@ -1644,13 +1644,14 @@ def _measure_to_op_field(measure: str) -> tuple[AggregateOp, str | None]:
 
 
 def _unwrap_optional(annotation: Any) -> Any:
-    """``Optional[T]`` → ``T``; bare ``T`` → ``T``."""
+    """``Optional[T]`` / ``T | None`` → ``T``; bare ``T`` → ``T``."""
+    import types
     import typing
     origin = typing.get_origin(annotation)
-    if origin is typing.Union or origin is type(None) or str(
-        origin,
-    ) == "types.UnionType":
-        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+    if origin is typing.Union or origin is types.UnionType:
+        args = [
+            a for a in typing.get_args(annotation) if a is not type(None)
+        ]
         if len(args) == 1:
             return args[0]
     return annotation
