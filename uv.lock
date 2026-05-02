@@ -328,7 +328,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "django", specifier = ">=5.0" },
+    { name = "django", specifier = ">=6.0" },
     { name = "strawberry-graphql", specifier = ">=0.315.0" },
     { name = "strawberry-graphql-django", specifier = ">=0.82.0" },
 ]

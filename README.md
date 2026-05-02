@@ -82,15 +82,16 @@ type OrderGrouped {
 - **Cross-database aggregation.** PostgreSQL + SQLite only. SQLite degrades gracefully on `array_agg`/`string_agg`/`stddev`/`variance` — those operators raise `OperatorNotSupportedError` at resolver entry.
 - **Auto-traversal of one-to-many / many-to-many for measures.** This is the silent row-multiplication footgun [Odoo refuses to ship](https://github.com/odoo/odoo/blob/18.0/odoo/models.py); we follow. `array_agg` is the explicit escape hatch.
 - **Permission integration.** The library expects a pre-scoped queryset — the caller has already applied `accessible_by(user)` or equivalent. This keeps the library compatible with django-guardian, django-rules, [django-rebac](#) (when shipped), or hand-rolled permission systems.
-- **Cursor pagination on grouped results.** Offset only for v1.
 
 ## Status
 
-Alpha. The schema shape, operator vocabulary, and `compute_aggregation` signature are stable. Builder ergonomics may evolve in 0.2.
+Stable (v1.0). Operator vocabulary, SDL emission, granularity tracks, and the `compute_aggregation` signature are part of the SemVer surface — see [`docs/SPEC.md`](./docs/SPEC.md) § 16. Runtime: Python 3.13, Django 6.0.
 
 ## Documentation
 
-See [`docs/SPEC.md`](./docs/SPEC.md) for the full contract — operator catalog, granularity tracks, HAVING semantics, ordering rules, timezone handling, and the Odoo-derived footgun audit.
+- Full contract: [`docs/SPEC.md`](./docs/SPEC.md) — operator catalog, granularity tracks, HAVING semantics, ordering rules, timezone handling, and the Odoo-derived footgun audit.
+- Naming and wire vocabulary: [`docs/TERMINOLOGY.md`](./docs/TERMINOLOGY.md)
+- Contributor quality gate: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
 
 ## License
 
