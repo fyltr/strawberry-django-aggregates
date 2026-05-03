@@ -85,6 +85,22 @@ def _to_camel_alias(snake: str) -> str:
     return to_camel_case(snake)
 
 
+def _camel_to_snake(name: str) -> str:
+    """``"wordCount"`` → ``"word_count"``; ``"word_count"`` → ``"word_count"``.
+
+    Used to translate wire-side aggregate-field names back to the
+    Python field names the compiler expects. Mirrors Strawberry's
+    :func:`to_snake_case` so the round-trip ``snake → camel → snake``
+    is always identity for ordinary identifiers. Note: JSON-path
+    aliases (``metadata__amount`` → wire ``metadata_Amount``) are
+    handled separately by :meth:`AggregateBuilder._json_alias_to_dotted`
+    — those round-trip through the dotted form, not through this
+    snake_case converter.
+    """
+    from strawberry.utils.str_converters import to_snake_case
+    return to_snake_case(name)
+
+
 # GraphQL camelCase wire-name → AggregateOp. Used by the resolver to
 # walk ``info.selected_fields`` and figure out which (op, field) pairs
 # to ask the compiler for.
@@ -1093,6 +1109,17 @@ class AggregateBuilder:
                     continue
                 if fname in a_fields:
                     yield (op, fname)
+                    continue
+                # Wire-side names are camelCase (Strawberry's default
+                # name converter); ``a_fields`` carries the Python /
+                # Django field names (snake_case). Translate before
+                # falling back to the JSON-path branch — otherwise
+                # plain multi-word fields like ``word_count`` never
+                # match and the ``sum``/``avg``/``min``/``max`` selection
+                # silently emits no annotation.
+                snake = _camel_to_snake(fname)
+                if snake != fname and snake in a_fields:
+                    yield (op, snake)
                     continue
                 # JSON-path alias (``metadata__amount``) — translate
                 # back to the dotted form the compiler expects.
