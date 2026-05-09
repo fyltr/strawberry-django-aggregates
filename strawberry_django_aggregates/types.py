@@ -31,7 +31,7 @@ import datetime
 import decimal
 import enum
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NewType
 
 import strawberry
 import strawberry.federation
@@ -61,8 +61,8 @@ if TYPE_CHECKING:
 # string-encoded ``BigInt`` scalar so JS clients past
 # ``Number.MAX_SAFE_INTEGER`` (2**53) survive end-to-end. Used as the
 # output type for ``SUM`` over integer Django fields. Per SPEC § 5.
-BigInt = strawberry.scalar(
-    int,
+BigInt = NewType("BigInt", int)
+BigIntScalar = strawberry.scalar(
     name="BigInt",
     description=(
         "64-bit signed integer encoded as a JSON string on the wire to "
@@ -73,6 +73,8 @@ BigInt = strawberry.scalar(
     serialize=str,
     parse_value=int,
 )
+BigInt._scalar_definition = BigIntScalar  # type: ignore[attr-defined]
+BIGINT_SCALAR_MAP = {BigInt: BigIntScalar}
 
 
 # ---------------------------------------------------------------------------
