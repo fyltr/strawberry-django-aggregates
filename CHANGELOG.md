@@ -5,6 +5,16 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.2.2] — 2026-05-09
+
+### Fixed
+
+- Aligned package metadata and the exported `__version__` with the 0.2.2
+  release tag.
+- Added tag-driven PyPI publishing through the repository `PYPI_TOKEN` secret.
+- Updated PyPI project links to the `fyltr/strawberry-django-aggregates`
+  repository.
+
 ## [0.2.1] — 2026-05-01
 
 The beta line closing the gap analysis vs Odoo 18 / Hasura / PostGraphile,

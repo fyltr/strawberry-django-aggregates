@@ -1,6 +1,6 @@
 [project]
 name            = "strawberry-django-aggregates"
-version         = "0.2.1"
+version         = "0.2.2"
 description     = "Hasura-shape aggregations over Django querysets in Strawberry GraphQL — count, sum, avg, min, max, stddev, variance, array_agg + Odoo-grade group-by with timezone-correct date bucketing."
 readme          = "README.md"
 requires-python = ">=3.14"
@@ -37,9 +37,9 @@ dependencies = [
 postgres = []
 
 [project.urls]
-Homepage      = "https://github.com/Apexive/strawberry-django-aggregates"
-Documentation = "https://github.com/Apexive/strawberry-django-aggregates/blob/main/docs/SPEC.md"
-Issues        = "https://github.com/Apexive/strawberry-django-aggregates/issues"
+Homepage      = "https://github.com/fyltr/strawberry-django-aggregates"
+Documentation = "https://github.com/fyltr/strawberry-django-aggregates/blob/main/docs/SPEC.md"
+Issues        = "https://github.com/fyltr/strawberry-django-aggregates/issues"
 
 [dependency-groups]
 dev = [
